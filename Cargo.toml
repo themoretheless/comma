@@ -1,0 +1,16 @@
+[package]
+name = "comma"
+version = "0.1.0"
+edition = "2024"
+default-run = "comma"
+
+[dependencies]
+eframe = "0.36"
+egui = "0.36"
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
+rustyline = "18"
+libc = "0.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
+glob = "0.3.4"

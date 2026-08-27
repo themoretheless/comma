@@ -1,0 +1,38 @@
+[text]
+red plain boldgreen under
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[colors]
+r0 c0 fg=Named(Red) bg=Named(Background)
+r0 c1 fg=Named(Red) bg=Named(Background)
+r0 c2 fg=Named(Red) bg=Named(Background)
+r0 c10 fg=Named(Green) bg=Named(Background)
+r0 c11 fg=Named(Green) bg=Named(Background)
+r0 c12 fg=Named(Green) bg=Named(Background)
+r0 c13 fg=Named(Green) bg=Named(Background)
+r0 c14 fg=Named(Green) bg=Named(Background)
+r0 c15 fg=Named(Green) bg=Named(Background)
+r0 c16 fg=Named(Green) bg=Named(Background)
+r0 c17 fg=Named(Green) bg=Named(Background)
+r0 c18 fg=Named(Green) bg=Named(Background)
