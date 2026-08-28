@@ -422,6 +422,59 @@ impl CommaApp {
                 }
             });
     }
+
+    /// Bottom bar: a "start menu" with app actions on the left and the
+    /// active tab status on the right.
+    fn show_bottom_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("start_menu").resizable(false).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let ctx = ui.ctx().clone();
+                ui.menu_button("❯ comma", |ui| {
+                    if ui.button("New tab  ⌘T").clicked() {
+                        self.new_tab(&ctx);
+                        ui.close();
+                    }
+                    if ui.button("Close tab  ⌘W").clicked() {
+                        let index = self.tabs.active_index();
+                        self.close_tab(index);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Copy selection  ⌘C").clicked() {
+                        if let Some(tab) = self.tabs.active() {
+                            Self::handle_copy(&ctx, tab);
+                        }
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Scroll to top").clicked() {
+                        if let Some(tab) = self.tabs.active() {
+                            tab.term().lock().scroll_display(Scroll::Top);
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Scroll to bottom").clicked() {
+                        if let Some(tab) = self.tabs.active() {
+                            scroll_to_bottom(tab);
+                        }
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                if let Some(tab) = self.tabs.active() {
+                    ui.separator();
+                    ui.label(tab.label());
+                }
+                let status = format!("tab {}/{}", self.tabs.active_index() + 1, self.tabs.len());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(status);
+                });
+            });
+        });
+    }
 }
 
 impl eframe::App for CommaApp {
@@ -436,6 +489,7 @@ impl eframe::App for CommaApp {
         }
 
         self.show_sidebar(ui);
+        self.show_bottom_bar(ui);
 
         let focused = ctx.input(|i| i.focused);
         let blink_on = blink_visible(self.blink_epoch.elapsed());
