@@ -30,7 +30,11 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("comma")
-            .with_inner_size([config.window_width, config.window_height]),
+            .with_inner_size([config.window_width, config.window_height])
+            // Content extends to the very top edge, under the hidden title
+            // bar (traffic lights stay, the area still drags the window).
+            .with_titlebar_shown(false)
+            .with_fullsize_content_view(true),
         ..Default::default()
     };
     eframe::run_native(

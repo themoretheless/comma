@@ -506,7 +506,8 @@ impl CommaApp {
             .resizable(false)
             .default_size(self.config.sidebar_width)
             .show(ui, |ui| {
-                ui.add_space(4.0);
+                // Clear the traffic-light buttons in the hidden title bar.
+                ui.add_space(28.0);
                 // Info-line colors, matching the shell prompt's cyan/magenta.
                 let cwd_color = {
                     let rgb = self.palette.indexed[6];
