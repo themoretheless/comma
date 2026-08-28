@@ -391,6 +391,15 @@ impl CommaApp {
             .default_size(self.config.sidebar_width)
             .show(ui, |ui| {
                 ui.add_space(4.0);
+                // Info-line colors, matching the shell prompt's cyan/magenta.
+                let cwd_color = {
+                    let rgb = self.palette.indexed[6];
+                    egui::Color32::from_rgb(rgb.r, rgb.g, rgb.b)
+                };
+                let branch_color = {
+                    let rgb = self.palette.indexed[5];
+                    egui::Color32::from_rgb(rgb.r, rgb.g, rgb.b)
+                };
                 let mut close = None;
                 let mut switch_to = None;
                 for (index, tab) in self.tabs.iter().enumerate() {
@@ -414,11 +423,11 @@ impl CommaApp {
                             cwd = "…".to_string()
                                 + &cwd.chars().skip(cwd.chars().count() - config::MAX_TAB_LABEL + 1).collect::<String>();
                         }
-                        ui.label(egui::RichText::new(cwd).small().weak());
+                        ui.label(egui::RichText::new(cwd).small().color(cwd_color));
                     }
                     // Third line: the git branch of that directory.
                     if let Some(branch) = tab.git_branch() {
-                        ui.label(egui::RichText::new(format!("⎇ {branch}")).small().weak());
+                        ui.label(egui::RichText::new(format!("⎇ {branch}")).small().color(branch_color));
                     }
                 }
                 if let Some(index) = switch_to {
