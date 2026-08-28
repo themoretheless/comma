@@ -1,0 +1,44 @@
+[
+  {
+    "label": "comma: run",
+    "command": "cargo",
+    "args": ["run"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "tags": ["rust-run"]
+  },
+  {
+    "label": "comma: run shell",
+    "command": "cargo",
+    "args": ["run", "--bin", "comma-shell"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "comma: test",
+    "command": "cargo",
+    "args": ["test"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "tags": ["rust-test"]
+  },
+  {
+    "label": "comma: clippy",
+    "command": "cargo",
+    "args": ["clippy", "--all-targets"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "no_focus"
+  },
+  {
+    "label": "comma: build release",
+    "command": "cargo",
+    "args": ["build", "--release"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "no_focus"
+  }
+]
