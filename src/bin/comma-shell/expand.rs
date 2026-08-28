@@ -50,13 +50,7 @@ fn expand_segments(
     env: &HashMap<String, String>,
     last_status: i32,
 ) -> Vec<Seg> {
-    let var = |name: &String| {
-        if name == "?" {
-            last_status.to_string()
-        } else {
-            env.get(name).cloned().unwrap_or_default()
-        }
-    };
+    let var = |name: &String| param_value(name, env, last_status).unwrap_or_default();
     let mut segments = Vec::new();
     for part in parts {
         match part {
@@ -83,16 +77,20 @@ fn expand_segments(
     segments
 }
 
+/// Value of a variable reference: `?` is the last exit status.
+fn param_value(name: &str, env: &HashMap<String, String>, last_status: i32) -> Option<String> {
+    if name == "?" { Some(last_status.to_string()) } else { env.get(name).cloned() }
+}
+
 /// Evaluate a `${...}` body: plain `${NAME}`, length `${#NAME}`, and the
 /// POSIX default/alternative forms `${NAME:-word}`, `${NAME-word}`,
-/// `${NAME:+word}`, `${NAME+word}` (`NAME` may be `?`). The word is used
-/// verbatim, without nested expansion. Unknown forms expand to nothing.
+/// `${NAME:+word}`, `${NAME+word}` (`NAME` may be `?`). The word is
+/// recursively expanded by [`expand_braced_word`]. Unknown forms expand to
+/// nothing.
 fn expand_param(body: &str, env: &HashMap<String, String>, last_status: i32) -> String {
-    let value = |name: &str| -> Option<String> {
-        if name == "?" { Some(last_status.to_string()) } else { env.get(name).cloned() }
-    };
     if let Some(name) = body.strip_prefix('#') {
-        return value(name).map_or_else(|| "0".into(), |v| v.chars().count().to_string());
+        return param_value(name, env, last_status)
+            .map_or_else(|| "0".into(), |v| v.chars().count().to_string());
     }
     // The name is the longest valid identifier prefix; the rest is the
     // operator and its word.
@@ -107,7 +105,7 @@ fn expand_param(body: &str, env: &HashMap<String, String>, last_status: i32) -> 
         return String::new();
     }
     if rest.is_empty() {
-        return value(name).unwrap_or_default();
+        return param_value(name, env, last_status).unwrap_or_default();
     }
     // `:-`/`:+` test "unset or null"; bare `-`/`+` test only "unset".
     let (test_null, rest) = match rest.strip_prefix(':') {
@@ -116,14 +114,110 @@ fn expand_param(body: &str, env: &HashMap<String, String>, last_status: i32) -> 
     };
     let op = rest.chars().next().unwrap_or(' ');
     let word = &rest[op.len_utf8()..];
-    let val = value(name);
+    let val = param_value(name, env, last_status);
     let use_value = if test_null { val.as_ref().is_some_and(|v| !v.is_empty()) } else { val.is_some() };
     match op {
-        '-' if !use_value => word.to_string(),
+        '-' if !use_value => expand_braced_word(word, env, last_status),
         '-' => val.unwrap_or_default(),
-        '+' if use_value => word.to_string(),
+        '+' if use_value => expand_braced_word(word, env, last_status),
         _ => String::new(),
     }
+}
+
+/// Expand the word of a `${VAR:-word}`-style operator: backslash escapes,
+/// quote removal, `$VAR` and nested `${...}` — but no command substitution
+/// and no field splitting (the word is a single value by definition).
+fn expand_braced_word(word: &str, env: &HashMap<String, String>, last_status: i32) -> String {
+    let chars: Vec<char> = word.chars().collect();
+    expand_word_span(&chars, 0, env, last_status, None).0
+}
+
+/// Scan `chars` from `i`, expanding variables until the `stop` quote (or the
+/// end); returns the expanded text and the next index.
+fn expand_word_span(
+    chars: &[char],
+    mut i: usize,
+    env: &HashMap<String, String>,
+    last_status: i32,
+    stop: Option<char>,
+) -> (String, usize) {
+    let mut out = String::new();
+    while i < chars.len() {
+        let c = chars[i];
+        if Some(c) == stop {
+            return (out, i + 1);
+        }
+        match c {
+            '\\' => {
+                if let Some(&next) = chars.get(i + 1) {
+                    out.push(next);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            '\'' if stop.is_none() => {
+                // Single quotes: literal until the closing quote.
+                i += 1;
+                while let Some(&c) = chars.get(i) {
+                    i += 1;
+                    if c == '\'' {
+                        break;
+                    }
+                    out.push(c);
+                }
+            }
+            '"' if stop.is_none() => {
+                let (inner, next) = expand_word_span(chars, i + 1, env, last_status, Some('"'));
+                out.push_str(&inner);
+                i = next;
+            }
+            '$' if chars.get(i + 1) == Some(&'{') => {
+                // Matching close with nesting; unbalanced → literal `$`.
+                let mut depth = 1;
+                let mut j = i + 2;
+                while j < chars.len() && depth > 0 {
+                    match chars[j] {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    let body: String = chars[i + 2..j - 1].iter().collect();
+                    out.push_str(&expand_param(&body, env, last_status));
+                    i = j;
+                } else {
+                    out.push('$');
+                    i += 1;
+                }
+            }
+            '$' => {
+                let mut end = i + 1;
+                if chars.get(end) == Some(&'?') {
+                    end += 1;
+                } else {
+                    while chars.get(end).is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') {
+                        end += 1;
+                    }
+                }
+                if end == i + 1 && chars.get(end) != Some(&'?') {
+                    out.push('$');
+                    i += 1;
+                } else {
+                    let name: String = chars[i + 1..end].iter().collect();
+                    out.push_str(&param_value(&name, env, last_status).unwrap_or_default());
+                    i = end;
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    (out, i)
 }
 
 /// IFS whitespace for word splitting: `$IFS` or the POSIX default.
@@ -140,13 +234,68 @@ struct Field {
     has_meta: bool,
 }
 
-/// Split segments into fields on IFS whitespace. Literal/quoted segments
-/// never split; an `Expanded` segment splits at IFS runs, with the leading
-/// piece joining the current field and a trailing IFS closing it (POSIX).
-/// An empty expansion contributes nothing; a word that expands to no fields
-/// at all disappears entirely.
-fn split_fields(segments: Vec<Seg>, ifs: &str) -> Vec<Field> {
+/// One split piece of an expanded segment.
+enum Piece {
+    /// No delimiter before this text: it joins the field being built.
+    Join(String),
+    /// A delimiter closes the current field (emitting an empty one when
+    /// there is none and the delimiter was non-whitespace, POSIX) and this
+    /// text starts the next field.
+    Next { emit_empty: bool, text: String },
+}
+
+/// Split `text` on IFS, POSIX style: runs of IFS whitespace collapse and
+/// never yield empty fields; a non-whitespace IFS char (adjacent IFS
+/// whitespace folds into it) terminates a field — even an empty one. Also
+/// returns whether the text ends with an IFS char: a trailing delimiter
+/// closes the pending field but leaves no empty field behind.
+fn split_ifs(text: &str, ifs: &str) -> (Vec<Piece>, bool) {
     let is_ifs = |c: char| ifs.contains(c);
+    let is_ws = |c: char| is_ifs(c) && c.is_whitespace();
+    let is_nonws = |c: char| is_ifs(c) && !c.is_whitespace();
+    let chars: Vec<char> = text.chars().collect();
+    let mut pieces = Vec::new();
+    let mut i = 0;
+    let mut first = true;
+    while i < chars.len() {
+        // One delimiter: an IFS-whitespace run, or one non-whitespace IFS
+        // char with the IFS whitespace around it.
+        let mut ws_run = false;
+        while i < chars.len() && is_ws(chars[i]) {
+            ws_run = true;
+            i += 1;
+        }
+        let mut hard = false;
+        if i < chars.len() && is_nonws(chars[i]) {
+            hard = true;
+            i += 1;
+            while i < chars.len() && is_ws(chars[i]) {
+                i += 1;
+            }
+        }
+        let start = i;
+        while i < chars.len() && !is_ifs(chars[i]) {
+            i += 1;
+        }
+        let content: String = chars[start..i].iter().collect();
+        if first && !ws_run && !hard {
+            pieces.push(Piece::Join(content));
+        } else {
+            pieces.push(Piece::Next { emit_empty: hard, text: content });
+        }
+        first = false;
+    }
+    let ends_with_ifs = text.chars().last().is_some_and(is_ifs);
+    (pieces, ends_with_ifs)
+}
+
+/// Split segments into fields on IFS. Literal/quoted segments never split;
+/// an `Expanded` segment splits per [`split_ifs`], with the leading piece
+/// joining the current field (adjacent unquoted expansions behave as one
+/// concatenated text, POSIX) and a trailing delimiter closing it. An empty
+/// expansion contributes nothing; a word that expands to no fields at all
+/// disappears entirely.
+fn split_fields(segments: Vec<Seg>, ifs: &str) -> Vec<Field> {
     let mut fields: Vec<Field> = Vec::new();
     let mut current: Option<Field> = None;
     for seg in segments {
@@ -166,31 +315,32 @@ fn split_fields(segments: Vec<Seg>, ifs: &str) -> Vec<Field> {
                 if text.is_empty() {
                     continue;
                 }
-                let starts_ifs = text.chars().next().is_some_and(is_ifs);
-                let ends_ifs = text.chars().last().is_some_and(is_ifs);
-                for (i, piece) in
-                    text.split(is_ifs).filter(|piece| !piece.is_empty()).enumerate()
-                {
-                    if i == 0 && !starts_ifs {
-                        let field = current.get_or_insert_with(Field::default);
-                        field.has_meta |= has_glob_chars(piece);
-                        field.text.push_str(piece);
-                        field.pattern.push_str(piece);
-                    } else {
-                        if let Some(field) = current.take() {
-                            fields.push(field);
+                let (pieces, ends_with_ifs) = split_ifs(&text, ifs);
+                for piece in pieces {
+                    match piece {
+                        Piece::Join(text) => {
+                            let field = current.get_or_insert_with(Field::default);
+                            field.has_meta |= has_glob_chars(&text);
+                            field.text.push_str(&text);
+                            field.pattern.push_str(&text);
                         }
-                        current = Some(Field {
-                            text: piece.to_string(),
-                            pattern: piece.to_string(),
-                            has_meta: has_glob_chars(piece),
-                        });
+                        Piece::Next { emit_empty, text } => {
+                            match current.take() {
+                                Some(field) => fields.push(field),
+                                None if emit_empty => fields.push(Field::default()),
+                                None => {}
+                            }
+                            current = Some(Field {
+                                has_meta: has_glob_chars(&text),
+                                pattern: text.clone(),
+                                text,
+                            });
+                        }
                     }
                 }
-                if ends_ifs
-                    && let Some(field) = current.take()
-                {
-                    fields.push(field);
+                // A trailing delimiter leaves no pending field behind.
+                if ends_with_ifs {
+                    current = None;
                 }
             }
         }
@@ -354,10 +504,49 @@ mod tests {
         assert_eq!(expand_word(&p("EMPTY:+alt"), &env, 0), "");
         assert_eq!(expand_word(&p("EMPTY+alt"), &env, 0), "alt");
         assert_eq!(expand_word(&p("MISSING+alt"), &env, 0), "");
+        // The word expands recursively: nested ${...}, $VAR, quote removal.
+        let env = env_with(&[("INNER", "deep"), ("X", "a b")]);
+        assert_eq!(expand_word(&p("OUTER:-${INNER}"), &env, 0), "deep");
+        assert_eq!(expand_word(&p("OUTER:-$INNER/x"), &env, 0), "deep/x");
+        assert_eq!(expand_word(&p("OUTER:-a \"b c\" 'd e'"), &env, 0), "a b c d e");
         // Quoted expands literally, unquoted splits like `$VAR`.
-        let env = env_with(&[("X", "a b")]);
         assert_eq!(glob_word(&[Part::QParam("X".into())], &env), ["a b"]);
         assert_eq!(glob_word(&[Part::Param("X".into())], &env), ["a", "b"]);
+    }
+
+    #[test]
+    fn ifs_non_whitespace_delimiters() {
+        // A non-whitespace IFS char terminates a field — even an empty one.
+        let env = env_with(&[("IFS", ","), ("X", "a,,b")]);
+        assert_eq!(glob_word(&[Part::Var("X".into())], &env), ["a", "", "b"]);
+        // A leading delimiter makes an empty field; a trailing one doesn't.
+        let env = env_with(&[("IFS", ","), ("X", ",a")]);
+        assert_eq!(glob_word(&[Part::Var("X".into())], &env), ["", "a"]);
+        let env = env_with(&[("IFS", ","), ("X", "a,")]);
+        assert_eq!(glob_word(&[Part::Var("X".into())], &env), ["a"]);
+        // IFS whitespace around a non-whitespace delimiter folds into it.
+        let env = env_with(&[("IFS", " ,"), ("X", "a , , b")]);
+        assert_eq!(glob_word(&[Part::Var("X".into())], &env), ["a", "", "b"]);
+        // A leading delimiter terminates a literal prefix, without an extra
+        // empty field.
+        let env = env_with(&[("IFS", ","), ("X", ",a")]);
+        assert_eq!(
+            glob_word(&[Part::Lit("pre".into()), Part::Var("X".into())], &env),
+            ["pre", "a"]
+        );
+        // Adjacent unquoted expansions split as one concatenated text.
+        let env = env_with(&[("IFS", ","), ("X", "a,"), ("Y", ",b")]);
+        assert_eq!(
+            glob_word(&[Part::Var("X".into()), Part::Var("Y".into())], &env),
+            ["a", "", "b"]
+        );
+        // A trailing delimiter closes the field: the next segment starts
+        // fresh instead of joining.
+        let env = env_with(&[("IFS", ","), ("X", "a,")]);
+        assert_eq!(
+            glob_word(&[Part::Var("X".into()), Part::Lit("post".into())], &env),
+            ["a", "post"]
+        );
     }
 
     /// Expand a command line in `dir` and return the resulting argv.

@@ -384,16 +384,27 @@ fn lex_subst(chars: &[char], start: usize) -> Result<(String, usize), ParseError
 }
 
 /// Body of a `${...}` parameter expansion; `start` points just past `{`.
-/// Returns the raw inner text and the index just past `}`. Braces don't
-/// nest: the first `}` closes the expansion.
+/// Returns the raw inner text and the index just past the closing `}`.
+/// Braces nest (so `${a:-${b}}` works).
 fn lex_braced(chars: &[char], start: usize) -> Result<(String, usize), ParseError> {
+    let mut depth = 1;
     let mut body = String::new();
     let mut i = start;
     while let Some(&c) = chars.get(i) {
-        if c == '}' {
-            return Ok((body, i + 1));
+        match c {
+            '{' => {
+                depth += 1;
+                body.push(c);
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((body, i + 1));
+                }
+                body.push(c);
+            }
+            _ => body.push(c),
         }
-        body.push(c);
         i += 1;
     }
     Err(ParseError::UnterminatedParam)
@@ -513,8 +524,9 @@ mod tests {
         assert_eq!(word("${FOO}"), vec![Part::Param("FOO".into())]);
         assert_eq!(word("x${FOO:-d}"), vec![Part::Lit("x".into()), Part::Param("FOO:-d".into())]);
         assert_eq!(word("\"${#FOO}\""), vec![Part::QParam("#FOO".into())]);
-        // Single quotes shield the expansion.
+        // Single quotes shield the expansion; braces nest.
         assert_eq!(word("'${FOO}'"), vec![Part::QLit("${FOO}".into())]);
+        assert_eq!(word("${A:-${B}}"), vec![Part::Param("A:-${B}".into())]);
         assert_eq!(lex("${FOO"), Err(ParseError::UnterminatedParam));
     }
 
