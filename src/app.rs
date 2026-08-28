@@ -32,6 +32,20 @@ fn scroll_lines(remainder: &mut f32, delta: f32, cell_height: f32) -> i32 {
     lines
 }
 
+/// Lines of wheel scrolling folded into one button-64/65 mouse report
+/// (xterm semantics), so a trackpad doesn't flood the program with events.
+const LINES_PER_WHEEL_REPORT: i32 = 3;
+
+/// Fold wheel lines into batched mouse reports: one report per
+/// `LINES_PER_WHEEL_REPORT` lines, the rest carried over to the next event.
+/// The result is signed: positive = wheel up (64), negative = down (65).
+fn batched_reports(pending: &mut i32, lines: i32) -> i32 {
+    *pending += lines;
+    let reports = *pending / LINES_PER_WHEEL_REPORT;
+    *pending -= reports * LINES_PER_WHEEL_REPORT;
+    reports
+}
+
 pub(crate) struct CommaApp {
     tabs: Tabs<Tab>,
     next_id: usize,
@@ -46,6 +60,8 @@ pub(crate) struct CommaApp {
     blink_epoch: Instant,
     /// Fractional wheel delta carried between events, in points.
     scroll_remainder: f32,
+    /// Whole wheel lines carried between events for batched mouse reports.
+    wheel_report_lines: i32,
 }
 
 impl CommaApp {
@@ -60,6 +76,7 @@ impl CommaApp {
             palette: render::Palette::with_overrides(&config.colors),
             blink_epoch: Instant::now(),
             scroll_remainder: 0.0,
+            wheel_report_lines: 0,
             config,
         };
         app.new_tab(&cc.egui_ctx);
@@ -144,6 +161,7 @@ impl CommaApp {
         let mut shortcuts = Vec::new();
         let mut typed = false;
         let mut scroll_remainder = std::mem::take(&mut self.scroll_remainder);
+        let mut wheel_report_lines = std::mem::take(&mut self.wheel_report_lines);
         if let Some(tab) = self.tabs.active_mut() {
             let mode = *tab.term().lock().mode();
             // Mouse reporting: the program asked for mouse events; the
@@ -189,9 +207,18 @@ impl CommaApp {
                         if let Some(pos) = ctx.input(|i| i.pointer.hover_pos())
                             && rect.contains(pos)
                         {
-                            let cb = if delta.y > 0.0 { 64 } else { 65 };
-                            let (col, row) = input::cell_at(pos, rect, cell_size);
-                            tab.write(&input::encode_mouse(encoding, cb, col, row, true));
+                            // Accumulate pixel deltas into lines and send one
+                            // wheel report per ~3 lines instead of one per
+                            // event — a trackpad would flood the program.
+                            let lines = scroll_lines(&mut scroll_remainder, delta.y, cell_size.y);
+                            let reports = batched_reports(&mut wheel_report_lines, lines);
+                            if reports != 0 {
+                                let cb = if reports > 0 { 64 } else { 65 };
+                                let (col, row) = input::cell_at(pos, rect, cell_size);
+                                for _ in 0..reports.abs() {
+                                    tab.write(&input::encode_mouse(encoding, cb, col, row, true));
+                                }
+                            }
                         }
                     }
                     egui::Event::Key { key, pressed: true, modifiers, .. } => {
@@ -209,13 +236,15 @@ impl CommaApp {
             // Wheel scrolls the scrollback only when the program didn't take
             // the mouse; same for text selection (still available with Shift).
             if !mouse_report {
-                Self::handle_wheel(ctx, tab, rect, cell_size, &mut scroll_remainder);
+                Self::handle_wheel(ctx, tab, rect, cell_size, &mut scroll_remainder, mode);
+                Self::handle_links(ctx, tab, rect, cell_size, response);
             }
             if !mouse_report || shift {
                 input::handle_selection(tab.term(), rect, cell_size, response);
             }
         }
         self.scroll_remainder = scroll_remainder;
+        self.wheel_report_lines = wheel_report_lines;
         // Typing resets the blink phase to "visible".
         if typed {
             self.blink_epoch = Instant::now();
@@ -296,17 +325,54 @@ impl CommaApp {
         }
     }
 
-    /// Scrollback via mouse wheel over the terminal area. Fractional
-    /// (trackpad) deltas accumulate across events until a full line.
-    fn handle_wheel(ctx: &Context, tab: &Tab, rect: Rect, cell_size: Vec2, remainder: &mut f32) {
+    /// Mouse wheel over the terminal area, without mouse reporting: scrolls
+    /// the scrollback on the main screen; on the alternate screen sends
+    /// arrow-key presses to the program instead (alternate scroll).
+    /// Fractional (trackpad) deltas accumulate across events until a line.
+    fn handle_wheel(
+        ctx: &Context,
+        tab: &Tab,
+        rect: Rect,
+        cell_size: Vec2,
+        remainder: &mut f32,
+        mode: TermMode,
+    ) {
         let hovered = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|pos| rect.contains(pos));
         if !hovered {
             return;
         }
         let delta = ctx.input(|i| i.smooth_scroll_delta.y);
         let lines = scroll_lines(remainder, delta, cell_size.y);
-        if lines != 0 {
+        if lines == 0 {
+            return;
+        }
+        if mode.contains(TermMode::ALT_SCREEN) {
+            tab.write(&input::alt_scroll_bytes(lines, mode.contains(TermMode::APP_CURSOR)));
+        } else {
             tab.term().lock().scroll_display(Scroll::Delta(lines));
+        }
+    }
+
+    /// Link interaction: Cmd+hover over an OSC-8 hyperlink or a detected
+    /// typed URL shows a pointing hand; a Cmd+click (press+release without
+    /// drag, so it doesn't fight selection) opens the URI.
+    fn handle_links(ctx: &Context, tab: &Tab, rect: Rect, cell_size: Vec2, response: &egui::Response) {
+        if !ctx.input(|i| i.modifiers.command) {
+            return;
+        }
+        let hovered = ctx.input(|i| i.pointer.hover_pos()).filter(|pos| rect.contains(*pos));
+        let Some(pos) = hovered else {
+            return;
+        };
+        let uri = input::link_at(&tab.term().lock(), pos, rect, cell_size);
+        let Some(uri) = uri else {
+            return;
+        };
+        ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+        if response.clicked()
+            && let Err(err) = std::process::Command::new("open").arg(&uri).spawn()
+        {
+            eprintln!("comma: failed to open {uri:?}: {err}");
         }
     }
 
@@ -428,6 +494,27 @@ mod tests {
         assert!(!blink_visible(period));
         assert!(!blink_visible(period * 2 - Duration::from_millis(1)));
         assert!(blink_visible(period * 2));
+    }
+
+    #[test]
+    fn wheel_reports_are_batched() {
+        let mut pending = 0;
+        // Two lines don't make a report yet; the third does.
+        assert_eq!(batched_reports(&mut pending, 2), 0);
+        assert_eq!(batched_reports(&mut pending, 1), 1);
+        assert_eq!(pending, 0);
+        // Seven lines at once: two reports, one line carried over.
+        assert_eq!(batched_reports(&mut pending, 7), 2);
+        assert_eq!(pending, 1);
+        // Downward lines batch the same way, with a negative sign.
+        let mut pending = 0;
+        assert_eq!(batched_reports(&mut pending, -2), 0);
+        assert_eq!(batched_reports(&mut pending, -4), -2);
+        assert_eq!(pending, 0);
+        // Opposite directions cancel out.
+        let mut pending = 2;
+        assert_eq!(batched_reports(&mut pending, -2), 0);
+        assert_eq!(pending, 0);
     }
 
     #[test]

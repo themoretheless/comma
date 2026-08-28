@@ -9,6 +9,7 @@ use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 use crate::config;
+use crate::input;
 use crate::pty::EventProxy;
 
 /// (width, height) of a terminal cell in points.
@@ -206,6 +207,25 @@ fn layout_row(font: &FontId, cells: &[RowCell]) -> Option<LayoutJob> {
     Some(job)
 }
 
+/// Underline the cells covered by typed `http(s)://` URLs in a row (the
+/// terminal's own detection; OSC-8 hyperlinks are underlined per cell).
+/// Runs on row rebuild only, i.e. for damaged rows.
+fn underline_urls(cells: &mut [RowCell]) {
+    let text: String = cells.iter().map(|cell| cell.text.as_str()).collect();
+    let spans = input::find_urls(&text);
+    if spans.is_empty() {
+        return;
+    }
+    let mut offset = 0; // char index of the current cell in the row text
+    for cell in cells.iter_mut() {
+        let len = cell.text.chars().count();
+        if spans.iter().any(|&(start, end)| offset < end && start < offset + len) {
+            cell.style.underline = true;
+        }
+        offset += len;
+    }
+}
+
 /// Per-tab cache of shaped text rows, so frames without terminal damage
 /// don't rebuild `LayoutJob`s. Rows are `Arc<Galley>`s indexed by display
 /// row; background rects and the cursor are repainted from the grid every
@@ -368,14 +388,17 @@ pub(crate) fn draw(
             }
             let style = CellStyle {
                 fg: to_color32(fg),
-                underline: tcell.flags.intersects(Flags::ALL_UNDERLINES),
+                // OSC-8 hyperlinks are underlined like terminal-detected URLs.
+                underline: tcell.flags.intersects(Flags::ALL_UNDERLINES)
+                    || tcell.hyperlink().is_some(),
                 strikethrough: tcell.flags.contains(Flags::STRIKEOUT),
             };
             stale_cells.entry(row).or_default().push(RowCell { text, style });
         }
     }
 
-    for (row, cells) in stale_cells {
+    for (row, mut cells) in stale_cells {
+        underline_urls(&mut cells);
         if let Some(entry) = cache.rows.get_mut(row) {
             *entry = layout_row(&font, &cells).map(|job| painter.layout_job(job));
         }
@@ -632,6 +655,24 @@ mod tests {
         let cells = [cell("a", RED), cell(" ", RED), cell(" ", RED)];
         let job = layout_row(&font(), &cells).unwrap();
         assert_eq!(job.text, "a");
+    }
+
+    #[test]
+    fn typed_urls_are_underlined() {
+        let text = "go https://x.io now";
+        let mut cells: Vec<RowCell> = text.chars().map(|c| cell(&c.to_string(), RED)).collect();
+        underline_urls(&mut cells);
+        let underlined: String = cells
+            .iter()
+            .zip(text.chars())
+            .filter(|(cell, _)| cell.style.underline)
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(underlined, "https://x.io");
+        // No URL: styles are untouched.
+        let mut cells = vec![cell("a", RED), cell("b", BLUE)];
+        underline_urls(&mut cells);
+        assert!(!cells.iter().any(|cell| cell.style.underline));
     }
 
     #[test]

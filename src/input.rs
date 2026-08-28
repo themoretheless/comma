@@ -98,8 +98,29 @@ pub(crate) fn key_to_bytes(
     app_cursor_mode: bool,
     kitty_mode: bool,
 ) -> Option<Vec<u8>> {
-    // Command-modified keys are app shortcuts (Cmd+T/W/C/V/1..9).
-    if mods.command {
+    if !kitty_mode {
+        // Legacy line-editing chords understood by readline/rustyline
+        // (which do not parse CSI sequences with modifiers).
+        if mods.command {
+            let bytes: &[u8] = match key {
+                Key::ArrowLeft => b"\x01",  // beginning of line
+                Key::ArrowRight => b"\x05", // end of line
+                Key::Backspace => b"\x15",  // kill line
+                // Other Cmd-modified keys are app shortcuts (Cmd+T/W/C/V/1..9).
+                _ => return None,
+            };
+            return Some(bytes.to_vec());
+        }
+        if mods.ctrl {
+            match key {
+                Key::ArrowLeft => return Some(b"\x1bb".to_vec()),  // word back
+                Key::ArrowRight => return Some(b"\x1bf".to_vec()), // word forward
+                Key::Backspace => return Some(vec![0x17]),         // kill word
+                _ => {}
+            }
+        }
+    } else if mods.command {
+        // Command-modified keys are app shortcuts (Cmd+T/W/C/V/1..9).
         return None;
     }
 
@@ -229,6 +250,71 @@ fn kitty_csi_u(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
     Some(format!("\x1b[{code};{}u", bits + 1).into_bytes())
 }
 
+/// Typed-URL detection: char-index half-open spans of `http://`/`https://`
+/// URLs in `text`. A URL runs to whitespace or the end of the text, and
+/// trailing punctuation that rarely belongs to a link is trimmed.
+pub(crate) fn find_urls(text: &str) -> Vec<(usize, usize)> {
+    /// Trailing characters cut off a detected URL.
+    const TRIM: &[char] = &['.', ',', ';', ':', '!', '?', ')', ']', '}', '>', '\'', '"'];
+    let mut starts: Vec<usize> = text
+        .match_indices("https://")
+        .chain(text.match_indices("http://"))
+        .map(|(index, _)| index)
+        .collect();
+    starts.sort_unstable();
+    let mut spans = Vec::new();
+    let mut covered = 0; // byte index up to which earlier URLs reach
+    for start in starts {
+        // Skip matches inside an earlier URL (e.g. in its query string).
+        if start < covered {
+            continue;
+        }
+        let rest = &text[start..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let url = rest[..end].trim_end_matches(TRIM);
+        if url.is_empty() {
+            continue;
+        }
+        let start_char = text[..start].chars().count();
+        spans.push((start_char, start_char + url.chars().count()));
+        covered = start + url.len();
+    }
+    spans
+}
+
+/// URI under a viewport position: the OSC-8 hyperlink stored in the cell
+/// (a link spans the run of neighboring cells with the same URI), else a
+/// typed URL detected in that grid row's text.
+pub(crate) fn link_at(term: &Term<EventProxy>, pos: Pos2, rect: Rect, cell: Vec2) -> Option<String> {
+    let columns = term.columns();
+    let point = cell_point(pos, rect, cell, term.grid().display_offset(), columns);
+    // The pointer may rest on the partial line below the last full row.
+    let line = Line(point.line.0.min(term.screen_lines() as i32 - 1));
+    let point = Point::new(line, point.column);
+    let grid = term.grid();
+    if let Some(hyperlink) = grid[point].hyperlink() {
+        return Some(hyperlink.uri().to_owned());
+    }
+    let row_text: String = (0..columns).map(|col| grid[line][Column(col)].c).collect();
+    let (start, end) = find_urls(&row_text)
+        .into_iter()
+        .find(|&(start, end)| (start..end).contains(&point.column.0))?;
+    Some(row_text.chars().skip(start).take(end - start).collect())
+}
+
+/// Arrow-key presses for wheel lines on the alternate screen (programs like
+/// less map them to scrolling): up for positive `lines`, down for negative,
+/// one press per line, in app-cursor form when the program enabled it.
+pub(crate) fn alt_scroll_bytes(lines: i32, app_cursor: bool) -> Vec<u8> {
+    let key: &[u8] = match (lines > 0, app_cursor) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+    };
+    key.repeat(lines.unsigned_abs() as usize)
+}
+
 /// Grid point under a mouse position, in grid coordinates (scrollback-aware).
 pub(crate) fn cell_point(
     pos: Pos2,
@@ -250,14 +336,27 @@ fn drag_side(pos: Pos2, rect: Rect, cell: Vec2) -> Side {
     if (pos.x - rect.left()) % cell.x < cell.x / 2.0 { Side::Left } else { Side::Right }
 }
 
-/// Mouse selection: drag creates/extends a simple selection, click clears it.
+/// Mouse selection: drag creates/extends a simple selection, click clears
+/// it; double click selects a word (semantic), triple click a whole line.
 pub(crate) fn handle_selection(
     term: &FairMutex<Term<EventProxy>>,
     rect: Rect,
     cell: Vec2,
     response: &egui::Response,
 ) {
-    if response.drag_started()
+    if response.triple_clicked_by(egui::PointerButton::Primary)
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let mut term = term.lock();
+        let point = cell_point(pos, rect, cell, term.grid().display_offset(), term.columns());
+        term.selection = Some(Selection::new(SelectionType::Lines, point, Side::Left));
+    } else if response.double_clicked_by(egui::PointerButton::Primary)
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let mut term = term.lock();
+        let point = cell_point(pos, rect, cell, term.grid().display_offset(), term.columns());
+        term.selection = Some(Selection::new(SelectionType::Semantic, point, Side::Left));
+    } else if response.drag_started()
         && let Some(pos) = response.interact_pointer_pos()
     {
         let mut term = term.lock();
@@ -467,6 +566,58 @@ mod tests {
         assert_eq!(kitty_bytes(Key::A, ctrl_shift), Some(b"\x1b[97;6u".to_vec()));
         // Digits with ctrl.
         assert_eq!(kitty_bytes(Key::Num1, CTRL), Some(b"\x1b[49;5u".to_vec()));
+    }
+
+    #[test]
+    fn legacy_editing_chords() {
+        // Ctrl+arrows/Backspace: word and line editing (readline bindings).
+        assert_eq!(bytes(Key::ArrowLeft, CTRL, false).as_deref(), Some(b"\x1bb".as_slice()));
+        assert_eq!(bytes(Key::ArrowRight, CTRL, false).as_deref(), Some(b"\x1bf".as_slice()));
+        assert_eq!(bytes(Key::Backspace, CTRL, false), Some(vec![0x17]));
+        // Cmd+arrows/Backspace: line start/end and kill-line.
+        assert_eq!(bytes(Key::ArrowLeft, CMD, false), Some(vec![0x01]));
+        assert_eq!(bytes(Key::ArrowRight, CMD, false), Some(vec![0x05]));
+        assert_eq!(bytes(Key::Backspace, CMD, false), Some(vec![0x15]));
+        // Other Cmd-modified keys stay app shortcuts.
+        assert_eq!(bytes(Key::ArrowUp, CMD, false), None);
+        assert_eq!(bytes(Key::T, CMD, false), None);
+    }
+
+    #[test]
+    fn kitty_mode_disables_legacy_chords() {
+        // With the kitty protocol on, Ctrl+arrows keep the current encoding…
+        assert_eq!(kitty_bytes(Key::ArrowLeft, CTRL), Some(b"\x1b[D".to_vec()));
+        // …and Cmd-modified keys remain app shortcuts.
+        assert_eq!(kitty_bytes(Key::ArrowLeft, CMD), None);
+        assert_eq!(kitty_bytes(Key::Backspace, CMD), None);
+    }
+
+    #[test]
+    fn typed_url_detection() {
+        assert_eq!(find_urls("see https://example.com here"), vec![(4, 23)]);
+        assert_eq!(find_urls("http://a.io and https://b.io"), vec![(0, 11), (16, 28)]);
+        assert_eq!(find_urls("no links here"), Vec::<(usize, usize)>::new());
+        // A URL runs to whitespace or the end of the text.
+        assert_eq!(find_urls("go http://x.io"), vec![(3, 14)]);
+        assert_eq!(find_urls("go http://x.io now"), vec![(3, 14)]);
+        // Trailing punctuation is trimmed.
+        assert_eq!(find_urls("(see https://x.io/a)."), vec![(5, 19)]);
+        assert_eq!(find_urls("at http://x.io, please"), vec![(3, 14)]);
+        // Inner punctuation is kept.
+        assert_eq!(find_urls("https://x.io:8080/a,b"), vec![(0, 21)]);
+        // A scheme inside an earlier URL's query string is not a new URL.
+        assert_eq!(find_urls("http://x.io/?u=http://y.io"), vec![(0, 26)]);
+        // Non-ASCII text before a URL: spans are char indices.
+        assert_eq!(find_urls("путь https://x.io"), vec![(5, 17)]);
+    }
+
+    #[test]
+    fn alt_scroll_sends_arrow_keys() {
+        assert_eq!(alt_scroll_bytes(2, false), b"\x1b[A\x1b[A");
+        assert_eq!(alt_scroll_bytes(-1, false), b"\x1b[B");
+        assert_eq!(alt_scroll_bytes(1, true), b"\x1bOA");
+        assert_eq!(alt_scroll_bytes(-3, true), b"\x1bOB\x1bOB\x1bOB");
+        assert_eq!(alt_scroll_bytes(0, false), Vec::<u8>::new());
     }
 
     #[test]
