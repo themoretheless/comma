@@ -4,6 +4,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::Event;
 use alacritty_terminal::grid::Dimensions;
@@ -15,6 +16,9 @@ use crate::config;
 use crate::pty::{self, EventProxy, PtySession, TermSize};
 use crate::render;
 
+/// How often the shell's working directory is re-polled for the tab label.
+const CWD_POLL: Duration = Duration::from_millis(500);
+
 /// One terminal tab: a PTY session plus its emulated terminal state.
 pub(crate) struct Tab {
     id: usize,
@@ -25,6 +29,10 @@ pub(crate) struct Tab {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Pid of the shell process; its cwd is shown under the tab label.
+    child_pid: Option<i32>,
+    /// Cached cwd poll result and when it was taken.
+    cwd_cache: std::cell::RefCell<(Instant, Option<String>)>,
     /// Shaped text rows reused on frames without terminal damage.
     render_cache: std::cell::RefCell<render::RowCache>,
     /// Set once the child process has exited; the app removes dead tabs.
@@ -41,7 +49,7 @@ impl Tab {
         cell_height: f32,
         config: &config::Config,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let PtySession { term, writer, master, killer } =
+        let PtySession { term, writer, master, killer, child_pid } =
             pty::spawn(id, sender, ctx, size, cell_width, cell_height, config)?;
         Ok(Self {
             id,
@@ -51,6 +59,11 @@ impl Tab {
             writer,
             master,
             killer,
+            child_pid,
+            cwd_cache: std::cell::RefCell::new((
+                Instant::now() - CWD_POLL,
+                None,
+            )),
             render_cache: std::cell::RefCell::new(render::RowCache::new()),
             dead: false,
         })
@@ -70,6 +83,18 @@ impl Tab {
 
     pub(crate) fn label(&self) -> String {
         self.title.clone().unwrap_or_else(|| self.default_title.clone())
+    }
+
+    /// Working directory of the shell process, re-polled at most every
+    /// `CWD_POLL` and shortened to `~` at `$HOME`. Note this tracks the
+    /// shell itself, not the program running in the foreground.
+    pub(crate) fn cwd(&self) -> Option<String> {
+        let mut cache = self.cwd_cache.borrow_mut();
+        if cache.0.elapsed() >= CWD_POLL {
+            cache.0 = Instant::now();
+            cache.1 = self.child_pid.and_then(process_cwd).map(|path| shorten_home(&path));
+        }
+        cache.1.clone()
     }
 
     pub(crate) fn set_title(&mut self, title: Option<String>) {
@@ -111,5 +136,71 @@ impl Tab {
 impl Drop for Tab {
     fn drop(&mut self) {
         let _ = self.killer.kill();
+    }
+}
+
+/// Working directory of process `pid` (macOS `proc_pidinfo`).
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: i32) -> Option<String> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+    // SAFETY: `info` is a valid writable buffer of `size` bytes, as the API
+    // requires; the returned path is NUL-terminated inside the struct.
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut std::ffi::c_void,
+            size,
+        )
+    };
+    if ret <= 0 {
+        return None;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+    Some(path.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_cwd(_pid: i32) -> Option<String> {
+    None
+}
+
+/// Shorten a leading `$HOME` to `~` for display.
+fn shorten_home(path: &str) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if path == home {
+            return "~".to_string();
+        }
+        if let Some(rest) = path.strip_prefix(home.as_ref())
+            && rest.starts_with('/')
+        {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shorten_home_replaces_prefix() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(shorten_home(&home), "~");
+        assert_eq!(shorten_home(&format!("{home}/x")), "~/x");
+        assert_eq!(shorten_home("/other/path"), "/other/path");
+        // A sibling whose name merely starts with $HOME's text is not $HOME.
+        assert_eq!(shorten_home(&format!("{home}x")), format!("{home}x"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn process_cwd_of_self_is_current_dir() {
+        let cwd = process_cwd(std::process::id() as i32).unwrap();
+        assert_eq!(cwd, std::env::current_dir().unwrap().to_string_lossy());
     }
 }

@@ -408,6 +408,14 @@ impl CommaApp {
                             close = Some(index);
                         }
                     });
+                    // Second line: the shell's working directory.
+                    if let Some(mut cwd) = tab.cwd() {
+                        if cwd.chars().count() > config::MAX_TAB_LABEL {
+                            cwd = "…".to_string()
+                                + &cwd.chars().skip(cwd.chars().count() - config::MAX_TAB_LABEL + 1).collect::<String>();
+                        }
+                        ui.label(egui::RichText::new(cwd).small().weak());
+                    }
                 }
                 if let Some(index) = switch_to {
                     self.tabs.switch(index);

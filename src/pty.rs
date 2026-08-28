@@ -97,6 +97,8 @@ pub(crate) struct PtySession {
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub master: Box<dyn MasterPty + Send>,
     pub killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Pid of the shell process (used to poll its cwd for the tab label).
+    pub child_pid: Option<i32>,
 }
 
 /// Which shell to run in a new session, by priority:
@@ -148,6 +150,7 @@ pub(crate) fn spawn(
     }
 
     let mut child = pair.slave.spawn_command(cmd)?;
+    let child_pid = child.process_id().map(|pid| pid as i32);
     let killer = child.clone_killer();
     let mut reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
@@ -195,6 +198,7 @@ pub(crate) fn spawn(
         writer: Arc::new(Mutex::new(writer)),
         master: pair.master,
         killer,
+        child_pid,
     })
 }
 
