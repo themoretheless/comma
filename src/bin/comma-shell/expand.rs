@@ -1,9 +1,11 @@
-//! Word expansion: `$VAR`, `${...}` forms (incl. `${VAR#pat}`/`${VAR%pat}`
-//! and nested words), `$((...))` arithmetic, `$?`, leading `~`, `$(...)` and
-//! `` `...` `` output, word splitting and globbing (`*`, `?`, `[...]` with
-//! `[!]`/`[^]` negation, `**` recursively), in POSIX order: expand → split →
-//! glob. Command substitution itself (`Part::Subst`/`QSubst`) is resolved by
-//! the executor before expansion (see `exec::substitute_pipeline`).
+//! Word expansion: `{a,b}`/`{1..10}` brace groups (first, bash-style, only
+//! in unquoted literal text), then `$VAR`, `${...}` forms (incl.
+//! `${VAR#pat}`/`${VAR%pat}` and nested words), `$((...))` arithmetic, `$?`,
+//! leading `~`, `$(...)` and `` `...` `` output, word splitting and globbing
+//! (`*`, `?`, `[...]` with `[!]`/`[^]` negation, `**` recursively), in POSIX
+//! order: expand → split → glob. Command substitution itself
+//! (`Part::Subst`/`QSubst`) is resolved by the executor before expansion
+//! (see `exec::substitute_pipeline`).
 
 use std::collections::HashMap;
 
@@ -537,8 +539,9 @@ fn glob_field(field: &Field) -> Vec<String> {
     if matches.is_empty() { vec![field.text.clone()] } else { matches }
 }
 
-/// Expand one word into argv entries: variable/tilde expansion, word
-/// splitting, then globbing.
+/// Expand one word into argv entries: brace expansion (bash-style, first),
+/// then per resulting word variable/tilde expansion, word splitting and
+/// globbing.
 fn expand_glob_word(
     parts: &[Part],
     env: &HashMap<String, String>,
@@ -548,8 +551,140 @@ fn expand_glob_word(
     if parts.is_empty() {
         return vec![String::new()];
     }
-    let fields = split_fields(expand_segments(parts, env, last_status), &ifs_chars(env));
-    fields.iter().flat_map(glob_field).collect()
+    let ifs = ifs_chars(env);
+    let mut out = Vec::new();
+    for variant in brace_expand_parts(parts) {
+        let fields = split_fields(expand_segments(&variant, env, last_status), &ifs);
+        out.extend(fields.iter().flat_map(glob_field));
+    }
+    out
+}
+
+/// Multiply a word over the brace groups of its unquoted literal parts
+/// (cartesian product when several parts/groups expand); every other part
+/// is copied to every variant unchanged, so quoting and `$...` expansions
+/// never participate.
+fn brace_expand_parts(parts: &[Part]) -> Vec<Vec<Part>> {
+    let mut variants: Vec<Vec<Part>> = vec![Vec::new()];
+    for part in parts {
+        match part {
+            Part::Lit(text) => {
+                let alts = brace_expand(text);
+                let mut next = Vec::with_capacity(variants.len() * alts.len());
+                for variant in &variants {
+                    for alt in &alts {
+                        let mut variant = variant.clone();
+                        variant.push(Part::Lit(alt.clone()));
+                        next.push(variant);
+                    }
+                }
+                variants = next;
+            }
+            other => {
+                for variant in &mut variants {
+                    variant.push(other.clone());
+                }
+            }
+        }
+    }
+    variants
+}
+
+/// Brace-expand one literal text: `{a,b}` comma lists and `{1..10[..step]}`
+/// integer ranges (descending and negative ranges work), nesting included.
+/// The leftmost valid group expands first; a group with no closing `}`, no
+/// top-level comma and no valid range stays literal, and scanning continues
+/// after it.
+fn brace_expand(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '{' {
+            continue;
+        }
+        if let Some((alts, end)) = parse_brace_group(&chars, i) {
+            let prefix: String = chars[..i].iter().collect();
+            let suffix: String = chars[end..].iter().collect();
+            let mut out = Vec::new();
+            for alt in alts {
+                for rest in brace_expand(&suffix) {
+                    out.push(format!("{prefix}{alt}{rest}"));
+                }
+            }
+            return out;
+        }
+    }
+    vec![text.to_string()]
+}
+
+/// Parse the `{...}` group at `chars[start]`, returning the fully expanded
+/// alternatives and the index just past the closing `}`; `None` when the
+/// group is invalid and must stay literal.
+fn parse_brace_group(chars: &[char], start: usize) -> Option<(Vec<String>, usize)> {
+    // Split the body on top-level commas; braces nest.
+    let mut depth = 0;
+    let mut parts: Vec<Vec<char>> = vec![Vec::new()];
+    let mut end = None;
+    for (i, &c) in chars.iter().enumerate().skip(start + 1) {
+        match c {
+            '{' => {
+                depth += 1;
+                parts.last_mut()?.push(c);
+            }
+            '}' if depth == 0 => {
+                end = Some(i + 1);
+                break;
+            }
+            '}' => {
+                depth -= 1;
+                parts.last_mut()?.push(c);
+            }
+            ',' if depth == 0 => parts.push(Vec::new()),
+            _ => parts.last_mut()?.push(c),
+        }
+    }
+    let end = end?;
+    if parts.len() > 1 {
+        // Comma list: every alternative brace-expands recursively.
+        let alts = parts
+            .iter()
+            .flat_map(|part| brace_expand(&part.iter().collect::<String>()))
+            .collect();
+        return Some((alts, end));
+    }
+    // No top-level comma: only an integer range is a valid group.
+    let body: String = parts[0].iter().collect();
+    range_expansion(&body).map(|alts| (alts, end))
+}
+
+/// `{a..b[..step]}` integer range, ascending or descending; the step is a
+/// magnitude. `None` when the body is not a valid range (the group then
+/// stays literal).
+fn range_expansion(body: &str) -> Option<Vec<String>> {
+    let mut pieces = body.split("..");
+    let first: i64 = pieces.next()?.parse().ok()?;
+    let last: i64 = pieces.next()?.parse().ok()?;
+    let step: i64 = match pieces.next() {
+        Some(piece) => piece.parse().ok()?,
+        None => 1,
+    };
+    if pieces.next().is_some() || step == 0 {
+        return None;
+    }
+    let step = step.unsigned_abs();
+    let mut out = Vec::new();
+    let mut n = first;
+    if first <= last {
+        while n <= last {
+            out.push(n.to_string());
+            n = n.checked_add(step as i64)?;
+        }
+    } else {
+        while n >= last {
+            out.push(n.to_string());
+            n = n.checked_sub(step as i64)?;
+        }
+    }
+    Some(out)
 }
 
 pub fn expand_argv(
@@ -757,8 +892,9 @@ mod tests {
         expanded
     }
 
-    /// Serializes tests that change the process cwd.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes tests that change the process cwd (shared with the exec
+    /// test module, same test process).
+    use crate::CWD_LOCK;
 
     /// Temp dir with files: a.rs, b.rs, c.txt, sub/d.toml, sub/deep/e.toml, .hidden
     fn glob_dir(name: &str) -> std::path::PathBuf {
@@ -811,6 +947,86 @@ mod tests {
         assert_eq!(expand_in_env(&dir, "$G", &env), vec!["a.rs", "b.rs"]);
         // ...but a redirect target (expand_word) is never globbed or split.
         assert_eq!(expand_word(&[Part::Var("G".into())], &env, 0), "*.rs");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Expand one lexed word (no cwd needed: no globbing involved).
+    fn brace_word(line: &str) -> Vec<String> {
+        let env = env_with(&[("FOO", "bar")]);
+        let tokens = crate::lexer::lex(line).unwrap();
+        match &tokens[0] {
+            crate::lexer::Token::Word(parts) => expand_glob_word(parts, &env, 0),
+            other => panic!("expected a word, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn brace_comma_lists_and_cartesian_products() {
+        assert_eq!(brace_word("{a,b}"), ["a", "b"]);
+        // Prefix and suffix join every alternative.
+        assert_eq!(brace_word("a{b,c}d"), ["abd", "acd"]);
+        // Several groups form a cartesian product, left to right.
+        assert_eq!(brace_word("{a,b}{c,d}"), ["ac", "ad", "bc", "bd"]);
+        assert_eq!(brace_word("x{a,b}y{c,d}z"), ["xaycz", "xaydz", "xbycz", "xbydz"]);
+        // An empty alternative is allowed.
+        assert_eq!(brace_word("{,a}.txt"), [".txt", "a.txt"]);
+        // Nested groups expand innermost-out, order preserved.
+        assert_eq!(brace_word("x{a,{b,c}}y"), ["xay", "xby", "xcy"]);
+        assert_eq!(brace_word("{{a,b},c}"), ["a", "b", "c"]);
+        assert_eq!(brace_word("{a,{b,{c,d}}}"), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn brace_integer_ranges() {
+        assert_eq!(brace_word("{1..5}"), ["1", "2", "3", "4", "5"]);
+        // Descending range.
+        assert_eq!(brace_word("{3..1}"), ["3", "2", "1"]);
+        // Explicit step, both directions.
+        assert_eq!(brace_word("{0..12..3}"), ["0", "3", "6", "9", "12"]);
+        assert_eq!(brace_word("{5..1..2}"), ["5", "3", "1"]);
+        // Negative bounds.
+        assert_eq!(brace_word("{-2..2}"), ["-2", "-1", "0", "1", "2"]);
+        // Range with affixes.
+        assert_eq!(brace_word("f{1..3}.rs"), ["f1.rs", "f2.rs", "f3.rs"]);
+    }
+
+    #[test]
+    fn invalid_brace_groups_stay_literal() {
+        // No comma and not a range.
+        assert_eq!(brace_word("{a}"), ["{a}"]);
+        assert_eq!(brace_word("{}"), ["{}"]);
+        // No closing brace.
+        assert_eq!(brace_word("{a,b"), ["{a,b"]);
+        // Not an integer range.
+        assert_eq!(brace_word("{a..b}"), ["{a..b}"]);
+        assert_eq!(brace_word("{1..}"), ["{1..}"]);
+        assert_eq!(brace_word("{1..2..0}"), ["{1..2..0}"]);
+        // An invalid outer group does not block a valid inner one.
+        assert_eq!(brace_word("a{b{c,d}e"), ["a{bce", "a{bde"]);
+    }
+
+    #[test]
+    fn brace_expansion_skips_quotes_and_expansions() {
+        // Quoted braces never expand.
+        assert_eq!(brace_word("'{a,b}'"), ["{a,b}"]);
+        assert_eq!(brace_word("\"{1..3}\""), ["{1..3}"]);
+        // A variable holding braces is not re-scanned.
+        let env = env_with(&[("B", "{a,b}")]);
+        assert_eq!(glob_word(&[Part::Var("B".into())], &env), ["{a,b}"]);
+        // ...but braces around a variable still multiply the word.
+        assert_eq!(brace_word("x{1,2}-$FOO"), ["x1-bar", "x2-bar"]);
+        // Quoting is resolved at lex time: quotes inside a brace group split
+        // it across parts, so the group does not expand (architectural
+        // limitation; bash would).
+        assert_eq!(brace_word("{'a b',c}"), ["{a b,c}"]);
+    }
+
+    #[test]
+    fn brace_results_still_glob() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = glob_dir("brace");
+        assert_eq!(expand_in(&dir, "*.{rs,txt}"), vec!["a.rs", "b.rs", "c.txt"]);
+        assert_eq!(expand_in(&dir, "{a,b}.rs"), vec!["a.rs", "b.rs"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

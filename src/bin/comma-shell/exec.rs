@@ -38,6 +38,10 @@ pub struct Shell {
     pub jobs: Vec<Job>,
     /// `alias` table: name → raw replacement text.
     pub aliases: HashMap<String, String>,
+    /// Directories visited by `cd`/auto-cd, oldest first.
+    pub dir_history: Vec<PathBuf>,
+    /// Cursor into `dir_history`: the `prevd`/`nextd` position.
+    pub dir_index: usize,
     /// Armed by a blocked `exit`: the very next bare `exit` really leaves.
     exit_armed: bool,
     /// When `Some`, command stdout that would go to the terminal is appended
@@ -66,6 +70,8 @@ impl Shell {
             history: Vec::new(),
             jobs: Vec::new(),
             aliases: HashMap::new(),
+            dir_history: Vec::new(),
+            dir_index: 0,
             exit_armed: false,
             capture: None,
             #[cfg(unix)]
@@ -74,6 +80,22 @@ impl Shell {
             #[cfg(not(unix))]
             term_pgid: 0,
         }
+    }
+
+    /// Record the current directory in the directory history after a
+    /// successful cd: drop any "future" entries past the cursor (the user
+    /// went back with `prevd` and then cd'd elsewhere), then push.
+    pub(crate) fn push_dir(&mut self) {
+        let Ok(dir) = std::env::current_dir() else {
+            return;
+        };
+        if !self.dir_history.is_empty() {
+            self.dir_history.truncate(self.dir_index + 1);
+        }
+        if self.dir_history.last() != Some(&dir) {
+            self.dir_history.push(dir);
+        }
+        self.dir_index = self.dir_history.len().saturating_sub(1);
     }
 
     /// Track a pipeline as a job; returns the assigned id (lowest free one).
@@ -351,6 +373,18 @@ fn execute_pipeline(shell: &mut Shell, pipeline: &Pipeline) -> i32 {
         let argv = expand::expand_argv(&cmd.argv, &shell.env, shell.last_status);
         let last = index == last_index;
 
+        // Auto-cd (fish/ion-style): a lone path-shaped word that is neither
+        // a builtin nor an executable but names a directory cds into it.
+        let argv = if pipeline.cmds.len() == 1
+            && cmd.redirects.is_empty()
+            && argv.len() == 1
+            && is_autocd_dir(shell, &argv[0])
+        {
+            vec!["cd".to_string(), argv[0].clone()]
+        } else {
+            argv
+        };
+
         let redirects = resolve_redirects(shell, cmd, last);
         let out_target = redirects.out;
         let err_file = redirects.err;
@@ -424,6 +458,98 @@ fn execute_pipeline(shell: &mut Shell, pipeline: &Pipeline) -> i32 {
 fn is_external(shell: &Shell, cmd: &Command) -> bool {
     let name = expand::expand_argv(&cmd.argv[..1.min(cmd.argv.len())], &shell.env, shell.last_status);
     name.first().is_some_and(|name| !crate::builtins::is_builtin(name))
+}
+
+/// PATH directories from the shell environment.
+fn path_dirs(shell: &Shell) -> impl Iterator<Item = PathBuf> + '_ {
+    shell
+        .env
+        .get("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(std::ffi::OsStr::new(path)))
+}
+
+/// Whether `name` resolves to an executable file: directly when it contains
+/// a slash, otherwise via the shell's PATH.
+fn resolves_to_executable(shell: &Shell, name: &str) -> bool {
+    if name.contains('/') {
+        return crate::is_executable(Path::new(name));
+    }
+    path_dirs(shell).any(|dir| crate::is_executable(&dir.join(name)))
+}
+
+/// Whether `word` is an auto-cd target: a path-shaped word (starts with `.`
+/// or `/`, or ends with `/`) that is not a builtin, resolves to no
+/// executable and names an existing directory.
+fn is_autocd_dir(shell: &Shell, word: &str) -> bool {
+    let path_shaped = word.starts_with('.') || word.starts_with('/') || word.ends_with('/');
+    path_shaped
+        && !crate::builtins::is_builtin(word)
+        && !resolves_to_executable(shell, word)
+        && Path::new(word).is_dir()
+}
+
+/// Edit distance (Levenshtein) between two strings, counted in chars;
+/// single-row dynamic programming.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            cur[j + 1] =
+                (prev[j] + usize::from(ca != cb)).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Candidate command names for "did you mean" suggestions: builtins plus
+/// every executable in the shell's PATH.
+fn command_candidates(shell: &Shell) -> Vec<String> {
+    let mut names: Vec<String> =
+        crate::builtins::NAMES.iter().map(|name| name.to_string()).collect();
+    for dir in path_dirs(shell) {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if crate::is_executable(&entry.path()) {
+                    names.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Closest candidate to a not-found `name` within a length-scaled edit
+/// distance (≤ 2 for short names, ≤ 3 for longer ones); `None` when nothing
+/// is close enough or the name is a path (PATH is not involved then).
+fn did_you_mean(shell: &Shell, name: &str) -> Option<String> {
+    if name.contains('/') {
+        return None;
+    }
+    let limit = if name.chars().count() <= 5 { 2 } else { 3 };
+    command_candidates(shell)
+        .into_iter()
+        .map(|candidate| (levenshtein(name, &candidate), candidate))
+        .filter(|(dist, _)| *dist <= limit)
+        .min_by(|(da, ca), (db, cb)| da.cmp(db).then_with(|| ca.cmp(cb)))
+        .map(|(_, candidate)| candidate)
+}
+
+/// Report a command that resolved to nothing (status 127): fish-style
+/// message with a "did you mean" hint when a close builtin/PATH name exists.
+fn report_not_found(shell: &Shell, name: &str) {
+    match did_you_mean(shell, name) {
+        Some(hint) => {
+            eprintln!("comma-shell: {name}: command not found (did you mean '{hint}'?)")
+        }
+        None => eprintln!("comma-shell: {name}: command not found"),
+    }
 }
 
 /// Display label of a pipeline for the job table: expanded argv words
@@ -911,8 +1037,14 @@ fn spawn_stages(shell: &Shell, pipeline: &Pipeline, capture_last: bool) -> Resul
                 children.push(child);
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("comma-shell: command not found: {}", argv[0]);
+                report_not_found(shell, &argv[0]);
                 failed = Some(127);
+                break;
+            }
+            // Found but not executable (fish-style 126).
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("comma-shell: {}: {err}", argv[0]);
+                failed = Some(126);
                 break;
             }
             Err(err) => {
@@ -1058,8 +1190,13 @@ fn run_external(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("comma-shell: command not found: {}", argv[0]);
+            report_not_found(shell, &argv[0]);
             return Err(127);
+        }
+        // Found but not executable (fish-style 126).
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("comma-shell: {}: {err}", argv[0]);
+            return Err(126);
         }
         Err(err) => {
             eprintln!("comma-shell: {}: {err}", argv[0]);
@@ -1484,5 +1621,155 @@ mod tests {
         assert_eq!(run(&mut shell, &line), 0);
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "42\nfile.txt\n");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn auto_cd_enters_directories() {
+        let _guard = crate::CWD_LOCK.lock().unwrap();
+        let saved = std::env::current_dir().unwrap();
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        let dir = temp_dir("autocd");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+
+        // Absolute path and trailing slash both trigger auto-cd.
+        assert_eq!(run(&mut shell, &format!("{}", dir.display())), 0);
+        assert_eq!(std::env::current_dir().unwrap(), dir.canonicalize().unwrap());
+        // Auto-cd is recorded in the directory history.
+        assert_eq!(shell.dir_history, vec![dir.canonicalize().unwrap()]);
+
+        // `..` (starts with a dot) climbs back.
+        assert_eq!(run(&mut shell, ".."), 0);
+        assert_eq!(
+            std::env::current_dir().unwrap(),
+            dir.parent().unwrap().canonicalize().unwrap()
+        );
+
+        // Relative entry with a trailing slash.
+        let sub = dir.join("sub").canonicalize().unwrap();
+        assert_eq!(run(&mut shell, &format!("{}/", sub.display())), 0);
+        assert_eq!(std::env::current_dir().unwrap(), sub);
+
+        // A path-shaped word naming nothing is still a plain 127, and a
+        // regular (non-executable) file is not cd'd into: 126 on unix.
+        assert_eq!(run(&mut shell, "./nope"), 127);
+        let file = dir.join("file");
+        std::fs::write(&file, "x").unwrap();
+        #[cfg(unix)]
+        assert_eq!(run(&mut shell, &format!("{}", file.display())), 126);
+
+        std::env::set_current_dir(&saved).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn directory_history_prevd_nextd_dirh() {
+        let _guard = crate::CWD_LOCK.lock().unwrap();
+        let saved = std::env::current_dir().unwrap();
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        let dir = temp_dir("dirh");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let a = a.canonicalize().unwrap();
+        let b = b.canonicalize().unwrap();
+
+        assert_eq!(run(&mut shell, &format!("cd {}", a.display())), 0);
+        assert_eq!(run(&mut shell, &format!("cd {}", b.display())), 0);
+        assert_eq!(shell.dir_history, vec![a.clone(), b.clone()]);
+        assert_eq!(shell.dir_index, 1);
+
+        // prevd moves back and prints the new directory.
+        let mut out = Vec::new();
+        assert_eq!(crate::builtins::run(&mut shell, &["prevd".into()], &mut out), Some(0));
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", a.display()));
+        assert_eq!(std::env::current_dir().unwrap(), a);
+        assert_eq!(shell.dir_index, 0);
+
+        // At the oldest entry prevd fails.
+        assert_eq!(
+            crate::builtins::run(&mut shell, &["prevd".into()], &mut Vec::new()),
+            Some(1)
+        );
+
+        // nextd moves forward; at the newest entry it fails.
+        assert_eq!(
+            crate::builtins::run(&mut shell, &["nextd".into()], &mut Vec::new()),
+            Some(0)
+        );
+        assert_eq!(std::env::current_dir().unwrap(), b);
+        assert_eq!(
+            crate::builtins::run(&mut shell, &["nextd".into()], &mut Vec::new()),
+            Some(1)
+        );
+
+        // dirh lists the history with the current entry marked.
+        let mut out = Vec::new();
+        assert_eq!(crate::builtins::run(&mut shell, &["dirh".into()], &mut out), Some(0));
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, format!("  {}\n* {}\n", a.display(), b.display()));
+
+        // Going back and then cd'ing elsewhere drops the "future" entries.
+        crate::builtins::run(&mut shell, &["prevd".into()], &mut Vec::new());
+        assert_eq!(run(&mut shell, &format!("cd {}", dir.canonicalize().unwrap().display())), 0);
+        assert_eq!(shell.dir_history, vec![a, dir.canonicalize().unwrap()]);
+
+        std::env::set_current_dir(&saved).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_file_is_126() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        let dir = temp_dir("noexec");
+        let script = dir.join("script.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(run(&mut shell, &format!("{}", script.display())), 126);
+        assert_eq!(shell.last_status, 126);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn levenshtein_distances() {
+        assert_eq!(levenshtein("foo", "food"), 1);
+        assert_eq!(levenshtein("ehco", "echo"), 2);
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("same", "same"), 0);
+        assert_eq!(levenshtein("abc", "xyz"), 3);
+    }
+
+    #[test]
+    fn did_you_mean_suggests_close_names() {
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        // A builtin within the distance limit is suggested...
+        assert_eq!(did_you_mean(&shell, "ehco"), Some("echo".to_string()));
+        // ...nothing is suggested when everything is too far away...
+        assert_eq!(did_you_mean(&shell, "zxqwvut"), None);
+        // ...and path-shaped names get no PATH-based suggestion.
+        assert_eq!(did_you_mean(&shell, "./ehco"), None);
+
+        // PATH executables participate.
+        let dir = temp_dir("dym");
+        let food = dir.join("food");
+        std::fs::write(&food, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&food, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        shell.env.insert("PATH".into(), dir.display().to_string());
+        assert_eq!(did_you_mean(&shell, "foob"), Some("food".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn not_found_status_stays_127_with_suggestion() {
+        // The suggestion is only a message: the status stays 127.
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        assert_eq!(run(&mut shell, "ehco hello"), 127);
+        assert_eq!(shell.last_status, 127);
     }
 }

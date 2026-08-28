@@ -1,5 +1,5 @@
 //! Shell builtins: cd, pwd, echo, exit, export, unset, env, history,
-//! jobs, fg, bg.
+//! jobs, fg, bg, alias, unalias, prevd, nextd, dirh.
 
 use std::io::Write;
 
@@ -8,7 +8,7 @@ use crate::exec::{JobState, Shell};
 /// All builtin names; `run` and `is_builtin` must stay in sync (tested).
 pub const NAMES: &[&str] = &[
     "cd", "pwd", "echo", "exit", "export", "unset", "env", "history", "jobs", "fg", "bg",
-    "alias", "unalias",
+    "alias", "unalias", "prevd", "nextd", "dirh",
 ];
 
 /// Whether `name` is a builtin.
@@ -34,6 +34,9 @@ pub fn run(shell: &mut Shell, argv: &[String], out: &mut dyn Write) -> Option<i3
         "bg" => shell.background(args.first().map(String::as_str), out),
         "alias" => alias(shell, args, out),
         "unalias" => unalias(shell, args, out),
+        "prevd" => prevd(shell, out),
+        "nextd" => nextd(shell, out),
+        "dirh" => dirh(shell, out),
         _ => return None,
     };
     Some(status)
@@ -54,6 +57,46 @@ fn cd(shell: &mut Shell, args: &[String], out: &mut dyn Write) -> i32 {
     };
     if let Err(err) = std::env::set_current_dir(&target) {
         return fail(out, &format!("cd: {target}: {err}"));
+    }
+    shell.push_dir();
+    0
+}
+
+/// `prevd`: move one entry back in the directory history (fish-style) and
+/// print the new directory; fails at the oldest entry.
+fn prevd(shell: &mut Shell, out: &mut dyn Write) -> i32 {
+    if shell.dir_index == 0 || shell.dir_history.is_empty() {
+        return fail(out, "prevd: no previous directory");
+    }
+    let dir = shell.dir_history[shell.dir_index - 1].clone();
+    if let Err(err) = std::env::set_current_dir(&dir) {
+        return fail(out, &format!("prevd: {}: {err}", dir.display()));
+    }
+    shell.dir_index -= 1;
+    let _ = writeln!(out, "{}", dir.display());
+    0
+}
+
+/// `nextd`: move one entry forward in the directory history (fish-style)
+/// and print the new directory; fails at the newest entry.
+fn nextd(shell: &mut Shell, out: &mut dyn Write) -> i32 {
+    let Some(dir) = shell.dir_history.get(shell.dir_index + 1).cloned() else {
+        return fail(out, "nextd: no next directory");
+    };
+    if let Err(err) = std::env::set_current_dir(&dir) {
+        return fail(out, &format!("nextd: {}: {err}", dir.display()));
+    }
+    shell.dir_index += 1;
+    let _ = writeln!(out, "{}", dir.display());
+    0
+}
+
+/// `dirh`: print the directory history, oldest first; the current entry
+/// (the `prevd`/`nextd` cursor) is marked with `*`.
+fn dirh(shell: &Shell, out: &mut dyn Write) -> i32 {
+    for (i, dir) in shell.dir_history.iter().enumerate() {
+        let mark = if i == shell.dir_index { "*" } else { " " };
+        let _ = writeln!(out, "{mark} {}", dir.display());
     }
     0
 }

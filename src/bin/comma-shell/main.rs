@@ -20,7 +20,12 @@ use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
-use rustyline::{Context, Editor, Helper};
+use rustyline::{Cmd, Config, Context, Editor, EventHandler, Helper, KeyCode, KeyEvent, Modifiers};
+
+/// Serializes tests that change the process cwd (the expand and exec test
+/// modules run in this same test process).
+#[cfg(test)]
+pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
@@ -188,7 +193,8 @@ fn command_names() -> Vec<String> {
     names
 }
 
-fn is_executable(path: &Path) -> bool {
+/// Whether `path` is an executable regular file (exec.rs uses this too).
+pub(crate) fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -232,9 +238,26 @@ fn main() {
         run_rc(&mut shell, &Path::new(&home).join(".commarc"));
     }
 
-    let mut rl = match Editor::<ShellHelper, DefaultHistory>::new() {
+    // Keep 10k history entries (the default 100 truncates long sessions)
+    // and skip space-prefixed lines.
+    let config = Config::builder()
+        .max_history_size(10_000)
+        .expect("10_000 is a valid history size")
+        .history_ignore_space(true)
+        .build();
+    let mut rl = match Editor::<ShellHelper, DefaultHistory>::with_config(config) {
         Ok(mut rl) => {
             rl.set_helper(Some(ShellHelper::new()));
+            // zsh-style: Up/Down search history by the prefix typed so far
+            // (on an empty line this is plain history navigation).
+            rl.bind_sequence(
+                KeyEvent(KeyCode::Up, Modifiers::NONE),
+                EventHandler::Simple(Cmd::HistorySearchBackward),
+            );
+            rl.bind_sequence(
+                KeyEvent(KeyCode::Down, Modifiers::NONE),
+                EventHandler::Simple(Cmd::HistorySearchForward),
+            );
             rl
         }
         Err(err) => {
