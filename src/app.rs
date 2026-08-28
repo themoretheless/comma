@@ -416,6 +416,10 @@ impl CommaApp {
                         }
                         ui.label(egui::RichText::new(cwd).small().weak());
                     }
+                    // Third line: the git branch of that directory.
+                    if let Some(branch) = tab.git_branch() {
+                        ui.label(egui::RichText::new(format!("⎇ {branch}")).small().weak());
+                    }
                 }
                 if let Some(index) = switch_to {
                     self.tabs.switch(index);

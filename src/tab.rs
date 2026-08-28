@@ -31,8 +31,8 @@ pub(crate) struct Tab {
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// Pid of the shell process; its cwd is shown under the tab label.
     child_pid: Option<i32>,
-    /// Cached cwd poll result and when it was taken.
-    cwd_cache: std::cell::RefCell<(Instant, Option<String>)>,
+    /// Cached cwd/git-branch poll result and when it was taken.
+    cwd_cache: std::cell::RefCell<(Instant, Option<String>, Option<String>)>,
     /// Shaped text rows reused on frames without terminal damage.
     render_cache: std::cell::RefCell<render::RowCache>,
     /// Set once the child process has exited; the app removes dead tabs.
@@ -60,10 +60,7 @@ impl Tab {
             master,
             killer,
             child_pid,
-            cwd_cache: std::cell::RefCell::new((
-                Instant::now() - CWD_POLL,
-                None,
-            )),
+            cwd_cache: std::cell::RefCell::new((Instant::now() - CWD_POLL, None, None)),
             render_cache: std::cell::RefCell::new(render::RowCache::new()),
             dead: false,
         })
@@ -89,12 +86,25 @@ impl Tab {
     /// `CWD_POLL` and shortened to `~` at `$HOME`. Note this tracks the
     /// shell itself, not the program running in the foreground.
     pub(crate) fn cwd(&self) -> Option<String> {
+        self.poll_cwd();
+        self.cwd_cache.borrow().1.as_deref().map(shorten_home)
+    }
+
+    /// Git branch of the repository containing the shell's cwd (detached
+    /// HEAD shows the short hash), re-polled with the cwd.
+    pub(crate) fn git_branch(&self) -> Option<String> {
+        self.poll_cwd();
+        self.cwd_cache.borrow().2.clone()
+    }
+
+    /// Re-poll the shell's cwd and git branch when the cache is stale.
+    fn poll_cwd(&self) {
         let mut cache = self.cwd_cache.borrow_mut();
         if cache.0.elapsed() >= CWD_POLL {
             cache.0 = Instant::now();
-            cache.1 = self.child_pid.and_then(process_cwd).map(|path| shorten_home(&path));
+            cache.1 = self.child_pid.and_then(process_cwd);
+            cache.2 = cache.1.as_deref().and_then(find_git_branch);
         }
-        cache.1.clone()
     }
 
     pub(crate) fn set_title(&mut self, title: Option<String>) {
@@ -183,6 +193,33 @@ fn shorten_home(path: &str) -> String {
     path.to_string()
 }
 
+/// Branch of the git repository containing `dir` (searching upwards), read
+/// straight from `.git/HEAD`: `ref: refs/heads/<name>` gives the branch, a
+/// bare hash (detached HEAD) its first 7 chars. Worktrees, whose `.git` is
+/// a `gitdir:` file, are followed. Returns `None` outside a repository.
+fn find_git_branch(dir: &str) -> Option<String> {
+    for ancestor in std::path::Path::new(dir).ancestors() {
+        let dotgit = ancestor.join(".git");
+        let head = if dotgit.is_dir() {
+            dotgit.join("HEAD")
+        } else if dotgit.is_file() {
+            // Worktree or submodule: `.git` points at the real gitdir.
+            let content = std::fs::read_to_string(&dotgit).ok()?;
+            let gitdir = content.trim().strip_prefix("gitdir:")?.trim();
+            ancestor.join(gitdir).join("HEAD")
+        } else {
+            continue;
+        };
+        let head = std::fs::read_to_string(head).ok()?;
+        let head = head.trim();
+        return Some(match head.strip_prefix("ref: refs/heads/") {
+            Some(branch) => branch.to_string(),
+            None => head.chars().take(7).collect(),
+        });
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +239,39 @@ mod tests {
     fn process_cwd_of_self_is_current_dir() {
         let cwd = process_cwd(std::process::id() as i32).unwrap();
         assert_eq!(cwd, std::env::current_dir().unwrap().to_string_lossy());
+    }
+
+    /// Temp dir; the caller removes it.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("comma-tab-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn git_branch_read_from_head_file() {
+        let dir = temp_dir("git");
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        assert_eq!(find_git_branch(dir.to_str().unwrap()).as_deref(), Some("feature/x"));
+        // A subdirectory walks up to the repository root.
+        let nested = dir.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(find_git_branch(nested.to_str().unwrap()).as_deref(), Some("feature/x"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_branch_detached_and_non_repo() {
+        let dir = temp_dir("detached");
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "0123456789abcdef\n").unwrap();
+        assert_eq!(find_git_branch(dir.to_str().unwrap()).as_deref(), Some("0123456"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = temp_dir("norepo");
+        assert_eq!(find_git_branch(dir.to_str().unwrap()), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
