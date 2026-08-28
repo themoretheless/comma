@@ -423,45 +423,90 @@ impl CommaApp {
             });
     }
 
+    /// Top menu bar: File / Tabs / Edit / View.
+    fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("menu_bar").show(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                let mut action = None;
+                ui.menu_button("File", |ui| {
+                    if ui.button("New tab  ⌘T").clicked() {
+                        action = Some(MenuAction::NewTab);
+                        ui.close();
+                    }
+                    if ui.button("Close tab  ⌘W").clicked() {
+                        action = Some(MenuAction::CloseTab);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        action = Some(MenuAction::Quit);
+                        ui.close();
+                    }
+                });
+                ui.menu_button("Tabs", |ui| {
+                    for (index, tab) in self.tabs.iter().enumerate() {
+                        let selected = index == self.tabs.active_index();
+                        if ui.selectable_label(selected, tab.label()).clicked() {
+                            action = Some(MenuAction::SwitchTo(index));
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Copy selection  ⌘C").clicked() {
+                        action = Some(MenuAction::CopySelection);
+                        ui.close();
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    if ui.button("Scroll to top").clicked() {
+                        action = Some(MenuAction::ScrollTop);
+                        ui.close();
+                    }
+                    if ui.button("Scroll to bottom").clicked() {
+                        action = Some(MenuAction::ScrollBottom);
+                        ui.close();
+                    }
+                });
+                if let Some(action) = action {
+                    self.apply_menu_action(ui.ctx(), action);
+                }
+            });
+        });
+    }
+
     /// Bottom bar: a "start menu" with app actions on the left and the
     /// active tab status on the right.
     fn show_bottom_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("start_menu").resizable(false).show(ui, |ui| {
             ui.horizontal(|ui| {
-                let ctx = ui.ctx().clone();
+                let mut action = None;
                 ui.menu_button("❯ comma", |ui| {
                     if ui.button("New tab  ⌘T").clicked() {
-                        self.new_tab(&ctx);
+                        action = Some(MenuAction::NewTab);
                         ui.close();
                     }
                     if ui.button("Close tab  ⌘W").clicked() {
-                        let index = self.tabs.active_index();
-                        self.close_tab(index);
+                        action = Some(MenuAction::CloseTab);
                         ui.close();
                     }
                     ui.separator();
                     if ui.button("Copy selection  ⌘C").clicked() {
-                        if let Some(tab) = self.tabs.active() {
-                            Self::handle_copy(&ctx, tab);
-                        }
+                        action = Some(MenuAction::CopySelection);
                         ui.close();
                     }
                     ui.separator();
                     if ui.button("Scroll to top").clicked() {
-                        if let Some(tab) = self.tabs.active() {
-                            tab.term().lock().scroll_display(Scroll::Top);
-                        }
+                        action = Some(MenuAction::ScrollTop);
                         ui.close();
                     }
                     if ui.button("Scroll to bottom").clicked() {
-                        if let Some(tab) = self.tabs.active() {
-                            scroll_to_bottom(tab);
-                        }
+                        action = Some(MenuAction::ScrollBottom);
                         ui.close();
                     }
                     ui.separator();
                     if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        action = Some(MenuAction::Quit);
                     }
                 });
                 if let Some(tab) = self.tabs.active() {
@@ -472,9 +517,50 @@ impl CommaApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.weak(status);
                 });
+                if let Some(action) = action {
+                    self.apply_menu_action(ui.ctx(), action);
+                }
             });
         });
     }
+
+    fn apply_menu_action(&mut self, ctx: &Context, action: MenuAction) {
+        match action {
+            MenuAction::NewTab => self.new_tab(ctx),
+            MenuAction::CloseTab => {
+                let index = self.tabs.active_index();
+                self.close_tab(index);
+            }
+            MenuAction::SwitchTo(index) => self.tabs.switch(index),
+            MenuAction::CopySelection => {
+                if let Some(tab) = self.tabs.active() {
+                    Self::handle_copy(ctx, tab);
+                }
+            }
+            MenuAction::ScrollTop => {
+                if let Some(tab) = self.tabs.active() {
+                    tab.term().lock().scroll_display(Scroll::Top);
+                }
+            }
+            MenuAction::ScrollBottom => {
+                if let Some(tab) = self.tabs.active() {
+                    scroll_to_bottom(tab);
+                }
+            }
+            MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+}
+
+/// Actions of the top menu bar and the bottom "start menu".
+enum MenuAction {
+    NewTab,
+    CloseTab,
+    SwitchTo(usize),
+    CopySelection,
+    ScrollTop,
+    ScrollBottom,
+    Quit,
 }
 
 impl eframe::App for CommaApp {
@@ -488,8 +574,9 @@ impl eframe::App for CommaApp {
             self.cell_size = Vec2::new(cell.0, cell.1);
         }
 
-        self.show_sidebar(ui);
+        self.show_menu_bar(ui);
         self.show_bottom_bar(ui);
+        self.show_sidebar(ui);
 
         let focused = ctx.input(|i| i.focused);
         let blink_on = blink_visible(self.blink_epoch.elapsed());
