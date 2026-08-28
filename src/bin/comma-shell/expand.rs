@@ -1,6 +1,8 @@
-//! Word expansion: `$VAR`, `$?`, leading `~` and globbing (`*`, `?`, `[...]`,
-//! `**` recursively). Command substitution (`Part::Subst`) is resolved by the
-//! executor before expansion (see `exec::substitute_pipeline`).
+//! Word expansion: `$VAR`, `$?`, leading `~`, `$(...)` output, word
+//! splitting and globbing (`*`, `?`, `[...]`, `**` recursively), in POSIX
+//! order: expand → split → glob. Command substitution itself
+//! (`Part::Subst`/`QSubst`) is resolved by the executor before expansion
+//! (see `exec::substitute_pipeline`).
 
 use std::collections::HashMap;
 
@@ -14,71 +16,153 @@ const GLOB_OPTIONS: glob::MatchOptions = glob::MatchOptions {
     require_literal_leading_dot: true,
 };
 
-/// Expand a word to a single string (used for redirect targets: no globbing).
+/// One expanded segment, by how it participates in splitting and globbing.
+enum Seg {
+    /// Unquoted literal text: joins fields, globs.
+    Lit(String),
+    /// Quoted text (quotes, `"$VAR"`, `"$()"`, `~`): joins fields literally.
+    Quoted(String),
+    /// Unquoted `$VAR`/`$()` result: splits on IFS whitespace, then globs.
+    Expanded(String),
+}
+
+impl Seg {
+    fn text(&self) -> &str {
+        match self {
+            Seg::Lit(text) | Seg::Quoted(text) | Seg::Expanded(text) => text,
+        }
+    }
+}
+
+/// Expand a word to a single string (used for redirect targets: no word
+/// splitting, no globbing).
 pub fn expand_word(
     parts: &[Part],
     env: &HashMap<String, String>,
     last_status: i32,
 ) -> String {
-    expand_segments(parts, env, last_status).into_iter().map(|(text, _)| text).collect()
+    expand_segments(parts, env, last_status).iter().map(Seg::text).collect()
 }
 
-/// Expand a word into its segments: text plus whether glob metacharacters in
-/// it are live (only unquoted `Part::Lit` segments glob, like the shell).
+/// Expand a word into its segments.
 fn expand_segments(
     parts: &[Part],
     env: &HashMap<String, String>,
     last_status: i32,
-) -> Vec<(String, bool)> {
+) -> Vec<Seg> {
+    let var = |name: &String| {
+        if name == "?" {
+            last_status.to_string()
+        } else {
+            env.get(name).cloned().unwrap_or_default()
+        }
+    };
     let mut segments = Vec::new();
     for part in parts {
         match part {
-            Part::Lit(text) => segments.push((text.clone(), true)),
-            Part::QLit(text) => segments.push((text.clone(), false)),
-            Part::Var(name) => {
-                let value = if name == "?" {
-                    last_status.to_string()
-                } else {
-                    env.get(name).cloned().unwrap_or_default()
-                };
-                segments.push((value, false));
-            }
+            Part::Lit(text) => segments.push(Seg::Lit(text.clone())),
+            Part::QLit(text) => segments.push(Seg::Quoted(text.clone())),
+            Part::Var(name) => segments.push(Seg::Expanded(var(name))),
+            Part::QVar(name) => segments.push(Seg::Quoted(var(name))),
             Part::Tilde => {
                 if let Some(home) = env.get("HOME") {
-                    segments.push((home.clone(), false));
+                    segments.push(Seg::Quoted(home.clone()));
                 }
             }
+            Part::SubstOut(text) => segments.push(Seg::Expanded(text.clone())),
             // Substitutions are already resolved by the executor.
-            Part::Subst(_) => {}
+            Part::Subst(_) | Part::QSubst(_) => {}
         }
     }
     segments
+}
+
+/// IFS whitespace for word splitting: `$IFS` or the POSIX default.
+fn ifs_chars(env: &HashMap<String, String>) -> String {
+    env.get("IFS").cloned().unwrap_or_else(|| " \t\n".to_string())
+}
+
+/// One output field: its text, its glob pattern (quoted chars escaped) and
+/// whether any unquoted segment contributed glob metacharacters.
+#[derive(Default)]
+struct Field {
+    text: String,
+    pattern: String,
+    has_meta: bool,
+}
+
+/// Split segments into fields on IFS whitespace. Literal/quoted segments
+/// never split; an `Expanded` segment splits at IFS runs, with the leading
+/// piece joining the current field and a trailing IFS closing it (POSIX).
+/// An empty expansion contributes nothing; a word that expands to no fields
+/// at all disappears entirely.
+fn split_fields(segments: Vec<Seg>, ifs: &str) -> Vec<Field> {
+    let is_ifs = |c: char| ifs.contains(c);
+    let mut fields: Vec<Field> = Vec::new();
+    let mut current: Option<Field> = None;
+    for seg in segments {
+        match seg {
+            Seg::Lit(text) => {
+                let field = current.get_or_insert_with(Field::default);
+                field.has_meta |= has_glob_chars(&text);
+                field.text.push_str(&text);
+                field.pattern.push_str(&text);
+            }
+            Seg::Quoted(text) => {
+                let field = current.get_or_insert_with(Field::default);
+                field.pattern.push_str(&glob::Pattern::escape(&text).to_string());
+                field.text.push_str(&text);
+            }
+            Seg::Expanded(text) => {
+                if text.is_empty() {
+                    continue;
+                }
+                let starts_ifs = text.chars().next().is_some_and(is_ifs);
+                let ends_ifs = text.chars().last().is_some_and(is_ifs);
+                for (i, piece) in
+                    text.split(is_ifs).filter(|piece| !piece.is_empty()).enumerate()
+                {
+                    if i == 0 && !starts_ifs {
+                        let field = current.get_or_insert_with(Field::default);
+                        field.has_meta |= has_glob_chars(piece);
+                        field.text.push_str(piece);
+                        field.pattern.push_str(piece);
+                    } else {
+                        if let Some(field) = current.take() {
+                            fields.push(field);
+                        }
+                        current = Some(Field {
+                            text: piece.to_string(),
+                            pattern: piece.to_string(),
+                            has_meta: has_glob_chars(piece),
+                        });
+                    }
+                }
+                if ends_ifs
+                    && let Some(field) = current.take()
+                {
+                    fields.push(field);
+                }
+            }
+        }
+    }
+    if let Some(field) = current {
+        fields.push(field);
+    }
+    fields
 }
 
 fn has_glob_chars(text: &str) -> bool {
     text.chars().any(|c| matches!(c, '*' | '?' | '['))
 }
 
-/// Expand one word into argv entries: variable/tilde expansion, then
-/// globbing. No matches → the word stays as-is (bash default).
-fn expand_glob_word(
-    parts: &[Part],
-    env: &HashMap<String, String>,
-    last_status: i32,
-) -> Vec<String> {
-    let segments = expand_segments(parts, env, last_status);
-    let literal: String = segments.iter().map(|(text, _)| text.as_str()).collect();
-    if !segments.iter().any(|(text, live)| *live && has_glob_chars(text)) {
-        return vec![literal];
+/// Glob one field's pattern; no matches (or no metacharacters) → the field
+/// text stays as-is (bash default).
+fn glob_field(field: &Field) -> Vec<String> {
+    if !field.has_meta {
+        return vec![field.text.clone()];
     }
-    // Segments that must not glob (quotes, variables) are pattern-escaped.
-    let pattern: String = segments
-        .iter()
-        .map(|(text, live)| {
-            if *live { text.clone() } else { glob::Pattern::escape(text).to_string() }
-        })
-        .collect();
-    let mut matches: Vec<String> = glob::glob_with(&pattern, GLOB_OPTIONS)
+    let mut matches: Vec<String> = glob::glob_with(&field.pattern, GLOB_OPTIONS)
         .map(|paths| {
             paths
                 .flatten()
@@ -90,7 +174,22 @@ fn expand_glob_word(
         })
         .unwrap_or_default();
     matches.sort();
-    if matches.is_empty() { vec![literal] } else { matches }
+    if matches.is_empty() { vec![field.text.clone()] } else { matches }
+}
+
+/// Expand one word into argv entries: variable/tilde expansion, word
+/// splitting, then globbing.
+fn expand_glob_word(
+    parts: &[Part],
+    env: &HashMap<String, String>,
+    last_status: i32,
+) -> Vec<String> {
+    // An explicitly quoted empty string still yields one (empty) field.
+    if parts.is_empty() {
+        return vec![String::new()];
+    }
+    let fields = split_fields(expand_segments(parts, env, last_status), &ifs_chars(env));
+    fields.iter().flat_map(glob_field).collect()
 }
 
 pub fn expand_argv(
@@ -112,6 +211,7 @@ mod tests {
     #[test]
     fn expands_vars_and_tilde() {
         assert_eq!(expand_word(&[Part::Var("FOO".into())], &env(), 0), "bar");
+        assert_eq!(expand_word(&[Part::QVar("FOO".into())], &env(), 0), "bar");
         assert_eq!(expand_word(&[Part::Var("MISSING".into())], &env(), 0), "");
         assert_eq!(expand_word(&[Part::Var("?".into())], &env(), 42), "42");
         assert_eq!(
@@ -124,9 +224,71 @@ mod tests {
         );
     }
 
+    fn env_with(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn glob_word(parts: &[Part], env: &HashMap<String, String>) -> Vec<String> {
+        expand_glob_word(parts, env, 0)
+    }
+
+    #[test]
+    fn unquoted_var_splits_on_ifs_whitespace() {
+        let env = env_with(&[("X", "a b c"), ("T", "p\tq\nr")]);
+        assert_eq!(glob_word(&[Part::Var("X".into())], &env), ["a", "b", "c"]);
+        // Tabs and newlines split too.
+        assert_eq!(glob_word(&[Part::Var("T".into())], &env), ["p", "q", "r"]);
+        // $IFS is honored.
+        let env = env_with(&[("IFS", ","), ("X", "a,b c")]);
+        assert_eq!(glob_word(&[Part::Var("X".into())], &env), ["a", "b c"]);
+    }
+
+    #[test]
+    fn quoted_var_does_not_split() {
+        let env = env_with(&[("X", "a b")]);
+        assert_eq!(glob_word(&[Part::QVar("X".into())], &env), ["a b"]);
+        // Mixed word: only the expansion boundary splits.
+        let env = env_with(&[("X", " x y")]);
+        assert_eq!(
+            glob_word(&[Part::Lit("a".into()), Part::Var("X".into())], &env),
+            ["a", "x", "y"]
+        );
+        let env = env_with(&[("X", "x y")]);
+        assert_eq!(
+            glob_word(&[Part::Lit("a".into()), Part::Var("X".into())], &env),
+            ["ax", "y"]
+        );
+    }
+
+    #[test]
+    fn empty_expansion_disappears_unless_quoted() {
+        let env = env_with(&[]);
+        // Bare `$EMPTY`: the word vanishes (no empty argument).
+        assert_eq!(glob_word(&[Part::Var("EMPTY".into())], &env), Vec::<String>::new());
+        // Quoted `"$EMPTY"`: one empty argument.
+        assert_eq!(glob_word(&[Part::QVar("EMPTY".into())], &env), [""]);
+        // Literal parts keep the word alive.
+        assert_eq!(
+            glob_word(&[Part::Lit("x".into()), Part::Var("EMPTY".into())], &env),
+            ["x"]
+        );
+    }
+
+    #[test]
+    fn substitution_output_splits_when_unquoted() {
+        let env = env_with(&[]);
+        assert_eq!(glob_word(&[Part::SubstOut("a b".into())], &env), ["a", "b"]);
+        // In double quotes the executor produces QLit: no splitting.
+        assert_eq!(glob_word(&[Part::QLit("a b".into())], &env), ["a b"]);
+    }
+
     /// Expand a command line in `dir` and return the resulting argv.
     /// Callers must hold `CWD_LOCK`: this changes the process cwd.
     fn expand_in(dir: &std::path::Path, line: &str) -> Vec<String> {
+        expand_in_env(dir, line, &HashMap::new())
+    }
+
+    fn expand_in_env(dir: &std::path::Path, line: &str, env: &HashMap<String, String>) -> Vec<String> {
         let tokens = crate::lexer::lex(line).unwrap();
         let word = match &tokens[0] {
             crate::lexer::Token::Word(parts) => parts.clone(),
@@ -134,7 +296,7 @@ mod tests {
         };
         let cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
-        let expanded = expand_glob_word(&word, &HashMap::new(), 0);
+        let expanded = expand_glob_word(&word, env, 0);
         std::env::set_current_dir(cwd).unwrap();
         expanded
     }
@@ -186,8 +348,10 @@ mod tests {
         assert_eq!(expand_in(&dir, "'*.rs'"), vec!["*.rs"]);
         // Quoted part does not glob, unquoted part does.
         assert_eq!(expand_in(&dir, "a'.'rs"), vec!["a.rs"]);
-        // A variable holding glob chars is not globbed either.
-        let env = HashMap::from([("G".to_string(), "*.rs".to_string())]);
+        // Unquoted variable holding glob chars: globbed (POSIX).
+        let env = env_with(&[("G", "*.rs")]);
+        assert_eq!(expand_in_env(&dir, "$G", &env), vec!["a.rs", "b.rs"]);
+        // ...but a redirect target (expand_word) is never globbed or split.
         assert_eq!(expand_word(&[Part::Var("G".into())], &env, 0), "*.rs");
         std::fs::remove_dir_all(&dir).ok();
     }

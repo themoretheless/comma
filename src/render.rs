@@ -29,9 +29,66 @@ fn to_color32(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.r, rgb.g, rgb.b)
 }
 
+/// Resolved color set used for drawing; defaults are the built-in constants
+/// from `config`, overridable via `[colors]` in `~/.comma.toml`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Palette {
+    pub foreground: Rgb,
+    pub background: Rgb,
+    pub cursor: Rgb,
+    pub selection: Color32,
+    /// Normal and bright ANSI colors (indices 0..16).
+    pub indexed: [Rgb; 16],
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            foreground: config::DEFAULT_FG,
+            background: config::DEFAULT_BG,
+            cursor: config::DEFAULT_CURSOR,
+            selection: config::SELECTION_BG,
+            indexed: config::PALETTE,
+        }
+    }
+}
+
+impl Palette {
+    /// Default palette with `[colors]` overrides applied; invalid hex values
+    /// warn and keep the default.
+    pub(crate) fn with_overrides(colors: &config::Colors) -> Self {
+        let mut palette = Self::default();
+        let apply = |slot: &mut Rgb, name: &str, value: &Option<String>| {
+            if let Some(value) = value {
+                match config::parse_hex_color(value) {
+                    Some(rgb) => *slot = rgb,
+                    None => eprintln!("comma: invalid color {name} = {value:?}, expected #RRGGBB"),
+                }
+            }
+        };
+        apply(&mut palette.foreground, "foreground", &colors.foreground);
+        apply(&mut palette.background, "background", &colors.background);
+        apply(&mut palette.cursor, "cursor", &colors.cursor);
+        if let Some(value) = &colors.selection_background {
+            match config::parse_hex_color(value) {
+                Some(rgb) => palette.selection = to_color32(rgb),
+                None => eprintln!(
+                    "comma: invalid color selection_background = {value:?}, expected #RRGGBB"
+                ),
+            }
+        }
+        for (slot, (name, value)) in
+            palette.indexed.iter_mut().zip(config::COLOR_NAMES.iter().zip(colors.indexed()))
+        {
+            apply(slot, name, value);
+        }
+        palette
+    }
+}
+
 /// Resolve a terminal color to an RGB value, honoring palette overrides
 /// set by the application through escape sequences.
-fn resolve(color: Color, flags: Flags, colors: &Colors, is_fg: bool) -> Rgb {
+fn resolve(color: Color, flags: Flags, colors: &Colors, is_fg: bool, palette: &Palette) -> Rgb {
     // Bold text on a base ANSI color is rendered with the bright variant.
     let color = match color {
         Color::Named(named) if is_fg && flags.contains(Flags::BOLD) => match named {
@@ -52,12 +109,12 @@ fn resolve(color: Color, flags: Flags, colors: &Colors, is_fg: bool) -> Rgb {
         Color::Spec(rgb) => rgb,
         Color::Named(named) => match colors[named] {
             Some(rgb) => rgb,
-            None => named_default(named),
+            None => named_default(named, palette),
         },
         Color::Indexed(index) => {
             match colors[index as usize] {
                 Some(rgb) => rgb,
-                None if index < 16 => config::PALETTE[index as usize],
+                None if index < 16 => palette.indexed[index as usize],
                 None if index < 232 => {
                     let i = index - 16;
                     let channel = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
@@ -74,21 +131,21 @@ fn resolve(color: Color, flags: Flags, colors: &Colors, is_fg: bool) -> Rgb {
     if flags.contains(Flags::DIM) { dim(rgb) } else { rgb }
 }
 
-fn named_default(named: NamedColor) -> Rgb {
+fn named_default(named: NamedColor, palette: &Palette) -> Rgb {
     match named {
-        NamedColor::Foreground => config::DEFAULT_FG,
-        NamedColor::Background => config::DEFAULT_BG,
-        NamedColor::Cursor => config::DEFAULT_CURSOR,
-        NamedColor::DimBlack => dim(config::PALETTE[0]),
-        NamedColor::DimRed => dim(config::PALETTE[1]),
-        NamedColor::DimGreen => dim(config::PALETTE[2]),
-        NamedColor::DimYellow => dim(config::PALETTE[3]),
-        NamedColor::DimBlue => dim(config::PALETTE[4]),
-        NamedColor::DimMagenta => dim(config::PALETTE[5]),
-        NamedColor::DimCyan => dim(config::PALETTE[6]),
-        NamedColor::DimWhite => dim(config::PALETTE[7]),
-        named if (named as usize) < 16 => config::PALETTE[named as usize],
-        _ => config::DEFAULT_FG,
+        NamedColor::Foreground => palette.foreground,
+        NamedColor::Background => palette.background,
+        NamedColor::Cursor => palette.cursor,
+        NamedColor::DimBlack => dim(palette.indexed[0]),
+        NamedColor::DimRed => dim(palette.indexed[1]),
+        NamedColor::DimGreen => dim(palette.indexed[2]),
+        NamedColor::DimYellow => dim(palette.indexed[3]),
+        NamedColor::DimBlue => dim(palette.indexed[4]),
+        NamedColor::DimMagenta => dim(palette.indexed[5]),
+        NamedColor::DimCyan => dim(palette.indexed[6]),
+        NamedColor::DimWhite => dim(palette.indexed[7]),
+        named if (named as usize) < 16 => palette.indexed[named as usize],
+        _ => palette.foreground,
     }
 }
 
@@ -201,6 +258,10 @@ fn stale_rows(
 }
 
 /// Draw the visible terminal content into `rect`.
+///
+/// `blink_visible` is the current blink phase (block cursor only);
+/// `focused` = the window has keyboard focus (else the cursor is hollow).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw(
     painter: &Painter,
     term: &mut Term<EventProxy>,
@@ -208,6 +269,9 @@ pub(crate) fn draw(
     cell: Vec2,
     font_size: f32,
     cache: &mut RowCache,
+    palette: &Palette,
+    blink_visible: bool,
+    focused: bool,
 ) {
     let painter = painter.with_clip_rect(rect);
     let screen_lines = term.screen_lines();
@@ -240,10 +304,20 @@ pub(crate) fn draw(
     let cursor = content.cursor;
     let selection = content.selection;
     let font = FontId::monospace(font_size);
-    let default_bg =
-        to_color32(resolve(Color::Named(NamedColor::Background), Flags::empty(), colors, false));
-    let default_fg =
-        to_color32(resolve(Color::Named(NamedColor::Foreground), Flags::empty(), colors, true));
+    let default_bg = to_color32(resolve(
+        Color::Named(NamedColor::Background),
+        Flags::empty(),
+        colors,
+        false,
+        palette,
+    ));
+    let default_fg = to_color32(resolve(
+        Color::Named(NamedColor::Foreground),
+        Flags::empty(),
+        colors,
+        true,
+        palette,
+    ));
 
     painter.rect_filled(rect, 0.0, default_bg);
 
@@ -265,8 +339,8 @@ pub(crate) fn draw(
         let row = row as usize;
         let col = indexed.point.column.0;
 
-        let mut fg = resolve(tcell.fg, tcell.flags, colors, true);
-        let mut bg = resolve(tcell.bg, tcell.flags, colors, false);
+        let mut fg = resolve(tcell.fg, tcell.flags, colors, true, palette);
+        let mut bg = resolve(tcell.bg, tcell.flags, colors, false, palette);
         if tcell.flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
         }
@@ -277,7 +351,7 @@ pub(crate) fn draw(
         let selected = selection.is_some_and(|s| s.contains(indexed.point));
         let bg32 = to_color32(bg);
         if selected || bg32 != default_bg {
-            let bg32 = if selected { config::SELECTION_BG } else { bg32 };
+            let bg32 = if selected { palette.selection } else { bg32 };
             // A wide char owns two cells: cover both halves with its background.
             let width = if tcell.flags.contains(Flags::WIDE_CHAR) { cell.x * 2.0 } else { cell.x };
             let pos = Pos2::new(rect.left() + col as f32 * cell.x, rect.top() + row as f32 * cell.y);
@@ -314,9 +388,23 @@ pub(crate) fn draw(
         }
     }
 
-    draw_cursor(&painter, cursor, colors, rect, cell, &font, default_bg, display_offset_i32, cursor_glyph);
+    draw_cursor(
+        &painter,
+        cursor,
+        colors,
+        rect,
+        cell,
+        &font,
+        default_bg,
+        display_offset_i32,
+        cursor_glyph,
+        palette,
+        blink_visible,
+        focused,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_cursor(
     painter: &Painter,
     cursor: alacritty_terminal::term::RenderableCursor,
@@ -327,13 +415,16 @@ fn draw_cursor(
     default_bg: Color32,
     display_offset: i32,
     cursor_glyph: Option<char>,
+    palette: &Palette,
+    blink_visible: bool,
+    focused: bool,
 ) {
     if display_offset != 0 {
         return;
     }
     let cursor_color = to_color32(match colors[NamedColor::Cursor] {
         Some(rgb) => rgb,
-        None => config::DEFAULT_CURSOR,
+        None => palette.cursor,
     });
     let pos = Pos2::new(
         rect.left() + cursor.point.column.0 as f32 * cell.x,
@@ -341,8 +432,12 @@ fn draw_cursor(
     );
     let cursor_rect = Rect::from_min_size(pos, cell);
 
-    match cursor.shape {
+    // An unfocused window always shows a hollow cursor; a block cursor in
+    // the hidden blink phase shows nothing (the text is still drawn).
+    let shape = if focused { cursor.shape } else { CursorShape::HollowBlock };
+    match shape {
         CursorShape::Hidden => {}
+        CursorShape::Block if !blink_visible => {}
         CursorShape::Block => {
             painter.rect_filled(cursor_rect, 0.0, cursor_color);
             // Redraw the glyph under the cursor in the background color.
@@ -376,7 +471,7 @@ mod tests {
     }
 
     fn resolved(color: Color, flags: Flags) -> Rgb {
-        resolve(color, flags, &Colors::default(), true)
+        resolve(color, flags, &Colors::default(), true, &Palette::default())
     }
 
     #[test]
@@ -425,7 +520,7 @@ mod tests {
         );
         // Only for foreground, and only for the eight base colors.
         assert_eq!(
-            resolve(Color::Named(NamedColor::Red), Flags::BOLD, &Colors::default(), false),
+            resolve(Color::Named(NamedColor::Red), Flags::BOLD, &Colors::default(), false, &Palette::default()),
             config::PALETTE[1]
         );
         assert_eq!(
@@ -444,7 +539,35 @@ mod tests {
     fn palette_overrides_win() {
         let mut colors = Colors::default();
         colors[NamedColor::Red] = Some(rgb(10, 20, 30));
-        assert_eq!(resolve(Color::Named(NamedColor::Red), Flags::empty(), &colors, true), rgb(10, 20, 30));
+        assert_eq!(
+            resolve(Color::Named(NamedColor::Red), Flags::empty(), &colors, true, &Palette::default()),
+            rgb(10, 20, 30)
+        );
+    }
+
+    #[test]
+    fn palette_with_config_overrides() {
+        let colors = config::Colors {
+            foreground: Some("#112233".into()),
+            red: Some("#010203".into()),
+            selection_background: Some("#040506".into()),
+            ..Default::default()
+        };
+        let palette = Palette::with_overrides(&colors);
+        assert_eq!(palette.foreground, rgb(0x11, 0x22, 0x33));
+        assert_eq!(palette.indexed[1], rgb(1, 2, 3));
+        assert_eq!(palette.selection, Color32::from_rgb(4, 5, 6));
+        // Untouched slots keep the defaults.
+        assert_eq!(palette.background, config::DEFAULT_BG);
+        assert_eq!(palette.indexed[2], config::PALETTE[2]);
+    }
+
+    #[test]
+    fn palette_invalid_hex_keeps_default() {
+        let colors = config::Colors { foreground: Some("nope".into()), ..Default::default() };
+        let palette = Palette::with_overrides(&colors);
+        assert_eq!(palette.foreground, config::DEFAULT_FG);
+        assert_eq!(Palette::default(), Palette::with_overrides(&config::Colors::default()));
     }
 
     // -- stale_rows (damage tracking) -----------------------------------------

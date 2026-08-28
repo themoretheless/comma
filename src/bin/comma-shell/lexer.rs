@@ -41,14 +41,23 @@ impl std::error::Error for ParseError {}
 pub enum Part {
     /// Literal unquoted text (glob metacharacters stay live).
     Lit(String),
-    /// Literal quoted text (no globbing, like the shell).
+    /// Literal quoted text (no globbing, no word splitting).
     QLit(String),
-    /// Environment variable reference (`$NAME` or `$?`).
+    /// Unquoted environment variable reference (`$NAME` or `$?`); the value
+    /// is word-split and globbed (POSIX).
     Var(String),
+    /// Double-quoted variable reference: expands literally.
+    QVar(String),
     /// Leading unquoted `~`.
     Tilde,
-    /// `$(...)` command substitution; holds the raw inner command line.
+    /// Unquoted `$(...)` command substitution; holds the raw inner command
+    /// line. The output is word-split and globbed.
     Subst(String),
+    /// Double-quoted `$(...)`; the output is substituted literally.
+    QSubst(String),
+    /// Output of an already-executed unquoted substitution (executor fills
+    /// this in); word-split and globbed like a variable.
+    SubstOut(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,7 +250,7 @@ fn lex_word(chars: &[char], mut i: usize) -> Result<(Vec<Part>, usize), ParseErr
                         Some(&'$') if chars.get(i + 1) == Some(&'(') => {
                             flush_all!();
                             let (body, next) = lex_subst(chars, i + 1)?;
-                            parts.push(Part::Subst(body));
+                            parts.push(Part::QSubst(body));
                             i = next;
                         }
                         Some(&'$') => {
@@ -249,7 +258,7 @@ fn lex_word(chars: &[char], mut i: usize) -> Result<(Vec<Part>, usize), ParseErr
                             i += 1;
                             let (name, next) = lex_var(chars, i);
                             match name {
-                                Some(name) => parts.push(Part::Var(name)),
+                                Some(name) => parts.push(Part::QVar(name)),
                                 None => push_quoted!('$'),
                             }
                             i = next;
@@ -394,7 +403,7 @@ mod tests {
         assert_eq!(word("'a $b'"), vec![Part::QLit("a $b".into())]);
         assert_eq!(
             word("\"a $b c\""),
-            vec![Part::QLit("a ".into()), Part::Var("b".into()), Part::QLit(" c".into())]
+            vec![Part::QLit("a ".into()), Part::QVar("b".into()), Part::QLit(" c".into())]
         );
         assert_eq!(word("a'b'c"), vec![Part::Lit("a".into()), Part::QLit("b".into()), Part::Lit("c".into())]);
         assert_eq!(word("''"), vec![]);
@@ -405,7 +414,7 @@ mod tests {
         assert_eq!(word("$(echo hi)"), vec![Part::Subst("echo hi".into())]);
         assert_eq!(
             word("\"pre-$(echo hi)\""),
-            vec![Part::QLit("pre-".into()), Part::Subst("echo hi".into())]
+            vec![Part::QLit("pre-".into()), Part::QSubst("echo hi".into())]
         );
         // Nested substitutions and quotes balance.
         assert_eq!(word("$(echo $(echo x))"), vec![Part::Subst("echo $(echo x)".into())]);

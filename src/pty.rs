@@ -102,7 +102,7 @@ pub(crate) struct PtySession {
 /// Which shell to run in a new session, by priority:
 /// 1. `COMMA_SHELL` env override, 2. `shell` from `~/.comma.toml`,
 /// 3. `comma-shell` binary next to the current executable (also one level up,
-/// for test binaries in `deps/`), 4. `$SHELL` or `/bin/zsh` as a fallback.
+///    for test binaries in `deps/`), 4. `$SHELL` or `/bin/zsh` as a fallback.
 fn shell_path(config: &config::Config) -> String {
     if let Ok(path) = std::env::var("COMMA_SHELL") {
         return path;

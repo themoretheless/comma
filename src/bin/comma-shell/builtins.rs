@@ -6,8 +6,10 @@ use std::io::Write;
 use crate::exec::{JobState, Shell};
 
 /// All builtin names; `run` and `is_builtin` must stay in sync (tested).
-pub const NAMES: &[&str] =
-    &["cd", "pwd", "echo", "exit", "export", "unset", "env", "history", "jobs", "fg", "bg"];
+pub const NAMES: &[&str] = &[
+    "cd", "pwd", "echo", "exit", "export", "unset", "env", "history", "jobs", "fg", "bg",
+    "alias", "unalias",
+];
 
 /// Whether `name` is a builtin.
 pub fn is_builtin(name: &str) -> bool {
@@ -22,7 +24,7 @@ pub fn run(shell: &mut Shell, argv: &[String], out: &mut dyn Write) -> Option<i3
         "cd" => cd(shell, args, out),
         "pwd" => pwd(out),
         "echo" => echo(args, out),
-        "exit" => exit(shell, args),
+        "exit" => exit(shell, args, out),
         "export" => export(shell, args, out),
         "unset" => unset(shell, args),
         "env" => print_env(shell, out),
@@ -30,6 +32,8 @@ pub fn run(shell: &mut Shell, argv: &[String], out: &mut dyn Write) -> Option<i3
         "jobs" => jobs(shell, out),
         "fg" => shell.foreground(args.first().map(String::as_str), out),
         "bg" => shell.background(args.first().map(String::as_str), out),
+        "alias" => alias(shell, args, out),
+        "unalias" => unalias(shell, args, out),
         _ => return None,
     };
     Some(status)
@@ -76,7 +80,11 @@ fn echo(args: &[String], out: &mut dyn Write) -> i32 {
     0
 }
 
-fn exit(shell: &mut Shell, args: &[String]) -> i32 {
+fn exit(shell: &mut Shell, args: &[String], out: &mut dyn Write) -> i32 {
+    // With live jobs the first `exit` only warns; the next one leaves.
+    if !shell.exit_guard(out) {
+        return 0;
+    }
     shell.should_exit = true;
     args.first().and_then(|code| code.parse().ok()).unwrap_or(0)
 }
@@ -131,6 +139,51 @@ fn jobs(shell: &mut Shell, out: &mut dyn Write) -> i32 {
         let _ = writeln!(out, "[{}]  {}  {}", job.id, state, job.command_line);
     }
     0
+}
+
+/// `alias` lists all aliases; `alias name` shows one; `alias name=value`
+/// defines it (the value keeps its raw text, quotes included).
+fn alias(shell: &mut Shell, args: &[String], out: &mut dyn Write) -> i32 {
+    let mut status = 0;
+    if args.is_empty() {
+        let mut entries: Vec<_> = shell.aliases.iter().collect();
+        entries.sort();
+        for (name, value) in entries {
+            let _ = writeln!(out, "alias {name}='{value}'");
+        }
+        return 0;
+    }
+    for arg in args {
+        match arg.split_once('=') {
+            Some((name, value)) if is_valid_name(name) => {
+                shell.aliases.insert(name.to_string(), value.to_string());
+            }
+            Some((name, _)) => {
+                status = fail(out, &format!("alias: `{name}': not a valid identifier"));
+            }
+            None => match shell.aliases.get(arg) {
+                Some(value) => {
+                    let _ = writeln!(out, "alias {arg}='{value}'");
+                }
+                None => status = fail(out, &format!("alias: {arg}: not found")),
+            },
+        }
+    }
+    status
+}
+
+fn unalias(shell: &mut Shell, args: &[String], out: &mut dyn Write) -> i32 {
+    let mut status = 0;
+    for name in args {
+        if name == "-a" {
+            shell.aliases.clear();
+            continue;
+        }
+        if shell.aliases.remove(name).is_none() {
+            status = fail(out, &format!("unalias: {name}: not found"));
+        }
+    }
+    status
 }
 
 fn is_valid_name(name: &str) -> bool {
@@ -201,5 +254,42 @@ mod tests {
         }
         assert!(!is_builtin("ls"));
         assert!(run(&mut shell(), &["ls".to_string()], &mut Vec::new()).is_none());
+    }
+
+    #[test]
+    fn alias_set_list_and_remove() {
+        let mut shell = shell();
+        let (status, _) = capture(&mut shell, &["alias", "ll=ls -la"]);
+        assert_eq!(status, 0);
+        assert_eq!(shell.aliases.get("ll").unwrap(), "ls -la");
+
+        let (status, text) = capture(&mut shell, &["alias", "ll"]);
+        assert_eq!((status, text.as_str()), (0, "alias ll='ls -la'\n"));
+
+        let (status, text) = capture(&mut shell, &["alias"]);
+        assert_eq!(status, 0);
+        assert!(text.contains("alias ll='ls -la'"), "listing: {text}");
+
+        let (status, _) = capture(&mut shell, &["unalias", "ll"]);
+        assert_eq!(status, 0);
+        assert!(!shell.aliases.contains_key("ll"));
+
+        let (status, text) = capture(&mut shell, &["unalias", "ll"]);
+        assert_eq!(status, 1);
+        assert!(text.contains("not found"), "text: {text}");
+        let (status, _) = capture(&mut shell, &["alias", "ll"]);
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn unalias_a_removes_everything() {
+        let mut shell = shell();
+        let _ = capture(&mut shell, &["alias", "a=one", "b=two"]);
+        assert_eq!(shell.aliases.len(), 2);
+        let (status, _) = capture(&mut shell, &["unalias", "-a"]);
+        assert_eq!(status, 0);
+        assert!(shell.aliases.is_empty());
+        let (_, text) = capture(&mut shell, &["alias"]);
+        assert_eq!(text, "");
     }
 }

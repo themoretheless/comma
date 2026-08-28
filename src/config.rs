@@ -37,6 +37,66 @@ pub struct Config {
     pub scrollback_lines: usize,
     /// Shell to run in new tabs (see `pty::shell_path` for the priority).
     pub shell: Option<String>,
+    /// Color overrides (`[colors]` section, `#RRGGBB` strings).
+    pub colors: Colors,
+}
+
+/// Color overrides from the `[colors]` section. Kept as raw strings so one
+/// invalid value doesn't invalidate the whole config; resolution (with
+/// warnings) happens in `render::Palette::with_overrides`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Colors {
+    pub foreground: Option<String>,
+    pub background: Option<String>,
+    pub cursor: Option<String>,
+    pub selection_background: Option<String>,
+    pub black: Option<String>,
+    pub red: Option<String>,
+    pub green: Option<String>,
+    pub yellow: Option<String>,
+    pub blue: Option<String>,
+    pub magenta: Option<String>,
+    pub cyan: Option<String>,
+    pub white: Option<String>,
+    pub bright_black: Option<String>,
+    pub bright_red: Option<String>,
+    pub bright_green: Option<String>,
+    pub bright_yellow: Option<String>,
+    pub bright_blue: Option<String>,
+    pub bright_magenta: Option<String>,
+    pub bright_cyan: Option<String>,
+    pub bright_white: Option<String>,
+}
+
+/// Names of the 16 palette slots, in palette index order (must match
+/// `PALETTE`).
+pub const COLOR_NAMES: [&str; 16] = [
+    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+    "bright_black", "bright_red", "bright_green", "bright_yellow", "bright_blue",
+    "bright_magenta", "bright_cyan", "bright_white",
+];
+
+impl Colors {
+    /// Override strings for the 16 indexed slots, in palette order.
+    pub fn indexed(&self) -> [&Option<String>; 16] {
+        [
+            &self.black, &self.red, &self.green, &self.yellow, &self.blue, &self.magenta,
+            &self.cyan, &self.white, &self.bright_black, &self.bright_red, &self.bright_green,
+            &self.bright_yellow, &self.bright_blue, &self.bright_magenta, &self.bright_cyan,
+            &self.bright_white,
+        ]
+    }
+}
+
+/// Parse a `#RRGGBB` color string.
+pub fn parse_hex_color(text: &str) -> Option<Rgb> {
+    let hex = text.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some(Rgb { r: channel(0)?, g: channel(2)?, b: channel(4)? })
 }
 
 impl Default for Config {
@@ -48,6 +108,7 @@ impl Default for Config {
             sidebar_width: SIDEBAR_WIDTH,
             scrollback_lines: SCROLLBACK_LINES,
             shell: None,
+            colors: Colors::default(),
         }
     }
 }
@@ -146,8 +207,37 @@ mod tests {
                 sidebar_width: 200.0,
                 scrollback_lines: 5000,
                 shell: Some("/bin/bash".into()),
+                colors: Colors::default(),
             }
         );
+    }
+
+    #[test]
+    fn colors_parse_from_toml() {
+        let config = Config::from_toml(
+            r##"
+                [colors]
+                foreground = "#112233"
+                red = "#cc6666"
+                bright_cyan = "#70c0b1"
+            "##,
+        )
+        .unwrap();
+        assert_eq!(config.colors.foreground.as_deref(), Some("#112233"));
+        assert_eq!(config.colors.red.as_deref(), Some("#cc6666"));
+        assert_eq!(config.colors.bright_cyan.as_deref(), Some("#70c0b1"));
+        assert_eq!(config.colors.blue, None);
+        // No [colors] section: everything stays None (defaults downstream).
+        assert_eq!(Config::from_toml("font_size = 14.0").unwrap().colors, Colors::default());
+    }
+
+    #[test]
+    fn hex_color_parsing() {
+        assert_eq!(parse_hex_color("#d8d8d8"), Some(Rgb { r: 0xd8, g: 0xd8, b: 0xd8 }));
+        assert_eq!(parse_hex_color("#1D1f21"), Some(Rgb { r: 0x1d, g: 0x1f, b: 0x21 }));
+        assert_eq!(parse_hex_color("d8d8d8"), None); // missing '#'
+        assert_eq!(parse_hex_color("#xyzxyz"), None); // not hex
+        assert_eq!(parse_hex_color("#123"), None); // too short
     }
 
     #[test]

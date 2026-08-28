@@ -9,6 +9,7 @@ mod parser;
 mod prompt;
 
 use std::borrow::Cow;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use exec::Shell;
@@ -199,10 +200,38 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// Run an rc file line by line through the executor; errors are reported
+/// with the line number and don't abort startup. A missing file is fine.
+fn run_rc(shell: &mut Shell, path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match parser::parse(line) {
+            Ok(script) => {
+                exec::execute_script(shell, &script);
+            }
+            Err(err) => eprintln!("comma-shell: {}:{}: {err}", path.display(), n + 1),
+        }
+    }
+}
+
 fn main() {
     install_signal_handlers();
 
     let mut shell = Shell::new();
+
+    // Startup file, interactive sessions only (stdin is a tty).
+    if std::io::stdin().is_terminal()
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        run_rc(&mut shell, &Path::new(&home).join(".commarc"));
+    }
+
     let mut rl = match Editor::<ShellHelper, DefaultHistory>::new() {
         Ok(mut rl) => {
             rl.set_helper(Some(ShellHelper::new()));
@@ -353,5 +382,24 @@ mod tests {
         // A name built from a variable cannot be validated: unstyled.
         let styled = highlight_line("$CMD hi", known);
         assert_eq!(styled, "$CMD hi");
+    }
+
+    #[test]
+    fn rc_file_runs_lines_and_survives_errors() {
+        let dir = std::env::temp_dir().join(format!("comma-rc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rc = dir.join("commarc");
+        std::fs::write(&rc, "export RC_ONE=1\n# comment\n\na & b\nexport RC_TWO=two\n").unwrap();
+
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        run_rc(&mut shell, &rc);
+        assert_eq!(shell.env.get("RC_ONE").unwrap(), "1");
+        // A parse error on one line doesn't stop the rest.
+        assert_eq!(shell.env.get("RC_TWO").unwrap(), "two");
+
+        // A missing rc file is not an error.
+        run_rc(&mut shell, &dir.join("does-not-exist"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -27,6 +27,66 @@ pub(crate) fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+/// SGR mouse report: `CSI < Cb ; Cx ; Cy M` for a press, `m` for a release.
+/// `cb` is the button/event code (left=0, middle=1, right=2, release=3,
+/// wheel up/down=64/65, motion adds 32); `col`/`row` are 0-based cell
+/// coordinates, encoded 1-based.
+pub(crate) fn sgr_mouse(cb: u8, col: usize, row: usize, pressed: bool) -> Vec<u8> {
+    let kind = if pressed { 'M' } else { 'm' };
+    format!("\x1b[<{cb};{};{}{kind}", col + 1, row + 1).into_bytes()
+}
+
+/// Mouse report encoding negotiated by the program: SGR (1006) when
+/// enabled, else the legacy X10 form. UTF8_MOUSE (1005) accepts the same
+/// bytes as X10 for our coordinate range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MouseEncoding {
+    Sgr,
+    X10,
+}
+
+pub(crate) fn mouse_encoding(sgr_mouse_mode: bool) -> MouseEncoding {
+    if sgr_mouse_mode { MouseEncoding::Sgr } else { MouseEncoding::X10 }
+}
+
+/// Encode one mouse report. Legacy X10 (`CSI M Cb Cx Cy`, bytes = 32 +
+/// value) has no release suffix: a release is always reported as cb=3, and
+/// coordinates are clamped to 223 (the max encodable cell).
+pub(crate) fn encode_mouse(
+    encoding: MouseEncoding,
+    cb: u8,
+    col: usize,
+    row: usize,
+    pressed: bool,
+) -> Vec<u8> {
+    match encoding {
+        MouseEncoding::Sgr => sgr_mouse(cb, col, row, pressed),
+        MouseEncoding::X10 => {
+            let cb = if pressed { cb } else { 3 };
+            let byte = |v: usize| (v.min(223) + 32) as u8;
+            vec![0x1b, b'[', b'M', 32 + cb, byte(col + 1), byte(row + 1)]
+        }
+    }
+}
+
+/// Button code for SGR reporting; buttons we don't report yield `None`.
+pub(crate) fn mouse_button_cb(button: egui::PointerButton) -> Option<u8> {
+    match button {
+        egui::PointerButton::Primary => Some(0),
+        egui::PointerButton::Middle => Some(1),
+        egui::PointerButton::Secondary => Some(2),
+        _ => None,
+    }
+}
+
+/// 0-based cell under a viewport position (used for mouse reporting, whose
+/// coordinates are viewport-relative — unlike selection points).
+pub(crate) fn cell_at(pos: Pos2, rect: Rect, cell: Vec2) -> (usize, usize) {
+    let col = ((pos.x - rect.left()) / cell.x).max(0.0) as usize;
+    let row = ((pos.y - rect.top()) / cell.y).max(0.0) as usize;
+    (col, row)
+}
+
 /// Byte sequence for a pressed key, or `None` when the key produces regular
 /// text (handled via `egui::Event::Text`) or an app-level shortcut.
 ///
@@ -49,10 +109,10 @@ pub(crate) fn key_to_bytes(
         return Some(bytes);
     }
 
-    if mods.ctrl {
-        if let Some(byte) = ctrl_byte(key) {
-            return Some(vec![byte]);
-        }
+    if mods.ctrl
+        && let Some(byte) = ctrl_byte(key)
+    {
+        return Some(vec![byte]);
     }
 
     let bytes: &[u8] = match key {
@@ -323,6 +383,48 @@ mod tests {
         assert_eq!(bytes(Key::T, CMD, false), None);
         assert_eq!(bytes(Key::C, CMD, false), None);
         assert_eq!(bytes(Key::ArrowUp, CMD, false), None);
+    }
+
+    #[test]
+    fn sgr_mouse_encoding() {
+        for (cb, col, row, pressed, expected) in [
+            (0, 0, 0, true, "\x1b[<0;1;1M"),      // left press, top-left cell
+            (3, 0, 0, false, "\x1b[<3;1;1m"),     // release
+            (1, 4, 2, true, "\x1b[<1;5;3M"),      // middle press
+            (2, 79, 23, true, "\x1b[<2;80;24M"),  // right press, bottom-right
+            (64, 5, 2, true, "\x1b[<64;6;3M"),    // wheel up
+            (65, 5, 2, true, "\x1b[<65;6;3M"),    // wheel down
+            (35, 10, 7, true, "\x1b[<35;11;8M"),  // motion, no button
+            (32, 10, 7, true, "\x1b[<32;11;8M"),  // drag with left button
+        ] {
+            assert_eq!(sgr_mouse(cb, col, row, pressed), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn mouse_button_codes() {
+        assert_eq!(mouse_button_cb(egui::PointerButton::Primary), Some(0));
+        assert_eq!(mouse_button_cb(egui::PointerButton::Middle), Some(1));
+        assert_eq!(mouse_button_cb(egui::PointerButton::Secondary), Some(2));
+        assert_eq!(mouse_button_cb(egui::PointerButton::Extra1), None);
+    }
+
+    #[test]
+    fn encode_mouse_picks_encoding_by_mode() {
+        assert_eq!(mouse_encoding(true), MouseEncoding::Sgr);
+        assert_eq!(mouse_encoding(false), MouseEncoding::X10);
+        for (encoding, cb, col, row, pressed, expected) in [
+            (MouseEncoding::Sgr, 0, 0, 0, true, &b"\x1b[<0;1;1M"[..]),
+            (MouseEncoding::Sgr, 3, 0, 0, false, b"\x1b[<3;1;1m"),
+            // X10: bytes are 32 + value, releases always cb=3 with 'M'.
+            (MouseEncoding::X10, 0, 0, 0, true, b"\x1b[M !!"),
+            (MouseEncoding::X10, 0, 0, 0, false, b"\x1b[M#!!"),
+            (MouseEncoding::X10, 64, 9, 4, true, b"\x1b[M`*%"),
+        ] {
+            assert_eq!(encode_mouse(encoding, cb, col, row, pressed), expected);
+        }
+        // Coordinates beyond 223 cells are clamped in X10.
+        assert_eq!(encode_mouse(MouseEncoding::X10, 0, 300, 300, true), b"\x1b[M \xff\xff");
     }
 
     #[test]

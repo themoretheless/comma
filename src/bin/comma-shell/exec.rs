@@ -36,6 +36,10 @@ pub struct Shell {
     pub history: Vec<String>,
     /// Background and stopped pipelines, oldest first.
     pub jobs: Vec<Job>,
+    /// `alias` table: name → raw replacement text.
+    pub aliases: HashMap<String, String>,
+    /// Armed by a blocked `exit`: the very next bare `exit` really leaves.
+    exit_armed: bool,
     /// When `Some`, command stdout that would go to the terminal is appended
     /// here instead (command substitution capture).
     capture: Option<Vec<u8>>,
@@ -61,6 +65,8 @@ impl Shell {
             should_exit: false,
             history: Vec::new(),
             jobs: Vec::new(),
+            aliases: HashMap::new(),
+            exit_armed: false,
             capture: None,
             #[cfg(unix)]
             // SAFETY: getpgrp is always safe to call.
@@ -91,12 +97,16 @@ impl Shell {
     /// Drop finished jobs and mark freshly stopped ones (WUNTRACED).
     /// A stopped job stays Stopped until `bg`/`fg` continues it: waitpid
     /// reports a stop transition only once, so "no event" must not
-    /// downgrade the state back to Running.
+    /// downgrade the state back to Running. Finished background jobs get a
+    /// bash-style notice (`[id]+ Done …` / `[id]+ Exit N …`); the REPL calls
+    /// this right before drawing the prompt.
     pub fn reap_jobs(&mut self) {
         #[cfg(unix)]
         {
+            let mut finished = Vec::new(); // (id, status, label, state)
             for job in &mut self.jobs {
                 let mut stopped = false;
+                let mut last_status = 0;
                 job.pids.retain(|&pid| {
                     let mut status = 0;
                     // SAFETY: waitpid on our own child; `status` is valid.
@@ -108,6 +118,7 @@ impl Shell {
                             stopped = true;
                             true // still alive, just stopped
                         } else {
+                            last_status = exit_code_from_raw(status);
                             false // exited or killed: drop
                         }
                     } else {
@@ -117,9 +128,33 @@ impl Shell {
                 if stopped {
                     job.state = JobState::Stopped;
                 }
+                if job.pids.is_empty() {
+                    finished.push((job.id, last_status, job.command_line.clone(), job.state));
+                }
             }
             self.jobs.retain(|job| !job.pids.is_empty());
+            for (id, status, label, state) in finished {
+                if state == JobState::Running {
+                    println!("{}", done_line(id, status, &label));
+                }
+            }
         }
+    }
+
+    /// Guard for the `exit` builtin: with live jobs the first bare `exit`
+    /// warns (bash-style) and stays; the next consecutive one leaves.
+    /// Returns true when the exit should proceed.
+    pub(crate) fn exit_guard(&mut self, out: &mut dyn Write) -> bool {
+        self.reap_jobs();
+        if self.jobs.is_empty() || self.exit_armed {
+            return true;
+        }
+        self.exit_armed = true;
+        let stopped = self.jobs.iter().any(|job| job.state == JobState::Stopped);
+        let message =
+            if stopped { "There are stopped jobs." } else { "There are running jobs." };
+        let _ = writeln!(out, "comma-shell: {message}");
+        false
     }
 
     /// `fg [%n]`: continue the job and wait for it in the foreground.
@@ -219,6 +254,10 @@ impl Shell {
 }
 
 pub fn execute_script(shell: &mut Shell, script: &Script) -> i32 {
+    // The double-exit guard survives only consecutive bare `exit` attempts.
+    if !is_exit_command(script) {
+        shell.exit_armed = false;
+    }
     let mut status = 0;
     for and_or in &script.seq {
         status = execute_and_or(shell, and_or);
@@ -228,6 +267,30 @@ pub fn execute_script(shell: &mut Shell, script: &Script) -> i32 {
     }
     shell.last_status = status;
     status
+}
+
+/// Whether the script is exactly one `exit` call (only such lines keep the
+/// double-exit guard armed).
+fn is_exit_command(script: &Script) -> bool {
+    let [and_or] = script.seq.as_slice() else {
+        return false;
+    };
+    if !and_or.rest.is_empty() {
+        return false;
+    }
+    let [cmd] = and_or.first.cmds.as_slice() else {
+        return false;
+    };
+    matches!(cmd.argv.first().map(Vec::as_slice), Some([Part::Lit(name)]) if name == "exit")
+}
+
+/// Bash-style notice for a finished background job.
+fn done_line(id: usize, status: i32, command_line: &str) -> String {
+    if status == 0 {
+        format!("[{id}]+ Done  {command_line}")
+    } else {
+        format!("[{id}]+ Exit {status}  {command_line}")
+    }
 }
 
 fn execute_and_or(shell: &mut Shell, and_or: &AndOr) -> i32 {
@@ -266,6 +329,8 @@ struct CmdOutcome {
 fn execute_pipeline(shell: &mut Shell, pipeline: &Pipeline) -> i32 {
     debug_assert!(!pipeline.cmds.is_empty(), "parser never yields empty pipelines");
 
+    // Aliases first (their values may contain substitutions), then $(...).
+    let pipeline = &expand_aliases(shell, pipeline);
     // Resolve $(...) substitutions before anything inspects argv.
     let pipeline = &substitute_pipeline(shell, pipeline);
 
@@ -384,9 +449,65 @@ fn write_out(shell: &mut Shell, bytes: &[u8]) {
     }
 }
 
-/// Clone `pipeline` with every `Part::Subst` replaced by the captured output
-/// of its command line (as a quoted literal: no re-expansion, no globbing,
-/// no word splitting).
+/// Clone `pipeline` with aliases expanded in command position: if the first
+/// literal word of a command names an alias, the alias value is re-lexed and
+/// its words are spliced in front of the remaining arguments. Chained
+/// aliases resolve recursively; `visited` stops self-referential loops.
+/// Alias values containing operators are left unexpanded (only plain word
+/// prefixes are supported).
+fn expand_aliases(shell: &Shell, pipeline: &Pipeline) -> Pipeline {
+    let mut pipeline = pipeline.clone();
+    if shell.aliases.is_empty() {
+        return pipeline;
+    }
+    for cmd in &mut pipeline.cmds {
+        expand_alias_cmd(&shell.aliases, cmd, &mut Vec::new());
+    }
+    pipeline
+}
+
+fn expand_alias_cmd(
+    aliases: &HashMap<String, String>,
+    cmd: &mut Command,
+    visited: &mut Vec<String>,
+) {
+    let name = match cmd.argv.first().map(Vec::as_slice) {
+        Some([Part::Lit(name)]) => name.clone(),
+        _ => return,
+    };
+    if visited.contains(&name) {
+        return;
+    }
+    let Some(value) = aliases.get(&name) else {
+        return;
+    };
+    let Ok(tokens) = crate::lexer::lex(value) else {
+        return;
+    };
+    let mut words = Vec::new();
+    for token in tokens {
+        match token {
+            crate::lexer::Token::Word(parts) => words.push(parts),
+            // Operators in an alias value: not supported, leave unexpanded.
+            _ => return,
+        }
+    }
+    if words.is_empty() {
+        return;
+    }
+    visited.push(name);
+    let mut argv = words;
+    argv.extend(cmd.argv.drain(1..));
+    cmd.argv = argv;
+    // The spliced first word may itself be an alias.
+    expand_alias_cmd(aliases, cmd, visited);
+    visited.pop();
+}
+
+/// Clone `pipeline` with every substitution part executed and replaced by
+/// its captured output: unquoted `$(...)` becomes `Part::SubstOut`
+/// (word-split and globbed at expansion, POSIX), double-quoted becomes
+/// `Part::QLit` (literal). No re-expansion of the output.
 fn substitute_pipeline(shell: &mut Shell, pipeline: &Pipeline) -> Pipeline {
     let mut pipeline = pipeline.clone();
     for cmd in &mut pipeline.cmds {
@@ -405,11 +526,20 @@ fn substitute_pipeline(shell: &mut Shell, pipeline: &Pipeline) -> Pipeline {
     pipeline
 }
 
-fn substitute_word(shell: &mut Shell, word: &mut Vec<Part>) {
+fn substitute_word(shell: &mut Shell, word: &mut [Part]) {
     for part in word.iter_mut() {
-        if let Part::Subst(line) = part {
-            let output = run_substitution(shell, line);
-            *part = Part::QLit(output);
+        match part {
+            // Unquoted substitution: the output is word-split and globbed.
+            Part::Subst(line) => {
+                let output = run_substitution(shell, line);
+                *part = Part::SubstOut(output);
+            }
+            // Quoted substitution: substituted literally.
+            Part::QSubst(line) => {
+                let output = run_substitution(shell, line);
+                *part = Part::QLit(output);
+            }
+            _ => {}
         }
     }
 }
@@ -1187,6 +1317,88 @@ mod tests {
         assert_eq!(subst(&mut shell, "echo x$(no-such-command-z)y"), ["echo", "xy"]);
         // The failing substitution does not break the outer command.
         assert_eq!(run(&mut shell, "echo $(false)"), 0);
+    }
+
+    #[test]
+    fn done_line_formats_bash_style_notices() {
+        assert_eq!(done_line(1, 0, "sleep 5"), "[1]+ Done  sleep 5");
+        assert_eq!(done_line(2, 130, "yes | head"), "[2]+ Exit 130  yes | head");
+    }
+
+    /// Expand aliases of a parsed command line and return its argv.
+    fn alias_argv(shell: &Shell, line: &str) -> Vec<String> {
+        let script = parser::parse(line).unwrap();
+        let pipeline = expand_aliases(shell, &script.seq[0].first);
+        pipeline.cmds[0]
+            .argv
+            .iter()
+            .map(|word| expand::expand_word(word, &shell.env, shell.last_status))
+            .collect()
+    }
+
+    #[test]
+    fn alias_expands_in_command_position() {
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        assert_eq!(run(&mut shell, "alias ll='echo -n'"), 0);
+        assert_eq!(alias_argv(&shell, "ll hello world"), ["echo", "-n", "hello", "world"]);
+        // Only command position: an argument named like an alias stays.
+        assert_eq!(alias_argv(&shell, "echo ll"), ["echo", "ll"]);
+        // Alias in a pipeline stage expands too.
+        let script = parser::parse("ll x | cat").unwrap();
+        let pipeline = expand_aliases(&shell, &script.seq[0].first);
+        assert_eq!(pipeline.cmds.len(), 2);
+        // Quoted value with inner quoting survives the re-lex.
+        assert_eq!(run(&mut shell, "alias q='echo \"a b\"'"), 0);
+        assert_eq!(alias_argv(&shell, "q"), ["echo", "a b"]);
+    }
+
+    #[test]
+    fn alias_chains_and_self_reference_do_not_hang() {
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        // Chained aliases resolve recursively.
+        assert_eq!(run(&mut shell, "alias x='y -a'"), 0);
+        assert_eq!(run(&mut shell, "alias y='echo'"), 0);
+        assert_eq!(alias_argv(&shell, "x hi"), ["echo", "-a", "hi"]);
+        // A self-referential alias expands once and stops.
+        assert_eq!(run(&mut shell, "alias loop='loop done'"), 0);
+        assert_eq!(alias_argv(&shell, "loop"), ["loop", "done"]);
+        // A two-step cycle stops as well.
+        assert_eq!(run(&mut shell, "alias a1='a2 x'"), 0);
+        assert_eq!(run(&mut shell, "alias a2='a1'"), 0);
+        assert_eq!(alias_argv(&shell, "a1"), ["a1", "x"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_with_live_jobs_warns_once_then_exits() {
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        assert_eq!(run(&mut shell, "sleep 63 &"), 0);
+        assert_eq!(shell.jobs.len(), 1);
+
+        // First exit with a live job: warns and stays.
+        assert_eq!(run(&mut shell, "exit"), 0);
+        assert!(!shell.should_exit);
+
+        // Any other command disarms the guard.
+        assert_eq!(run(&mut shell, "true"), 0);
+        assert_eq!(run(&mut shell, "exit"), 0);
+        assert!(!shell.should_exit);
+
+        // Second consecutive exit leaves.
+        assert_eq!(run(&mut shell, "exit"), 0);
+        assert!(shell.should_exit);
+
+        let pgid = shell.jobs[0].pgid;
+        // SAFETY: signaling a process group of our own child.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !shell.jobs.is_empty() {
+            shell.reap_jobs();
+            assert!(std::time::Instant::now() < deadline, "killed job was not reaped");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]
