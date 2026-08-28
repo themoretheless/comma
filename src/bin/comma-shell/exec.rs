@@ -1471,4 +1471,18 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "hello def\n");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn arithmetic_and_pattern_forms_execute() {
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        let dir = temp_dir("arith");
+        let out = dir.join("out.txt");
+        let line = format!("export X=6; echo $((X * 7)) > {}", out.display());
+        assert_eq!(run(&mut shell, &line), 0);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "42\n");
+        let line = format!("export V=path/to/file.txt; echo ${{V##*/}} >> {}", out.display());
+        assert_eq!(run(&mut shell, &line), 0);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "42\nfile.txt\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -18,6 +18,8 @@ pub enum ParseError {
     UnterminatedSubst,
     /// A `${` was never closed.
     UnterminatedParam,
+    /// A `$((` was never closed.
+    UnterminatedArith,
 }
 
 impl std::fmt::Display for ParseError {
@@ -32,6 +34,7 @@ impl std::fmt::Display for ParseError {
             ParseError::MissingRedirectTarget => "missing redirect target",
             ParseError::UnterminatedSubst => "unterminated command substitution",
             ParseError::UnterminatedParam => "unterminated parameter expansion",
+            ParseError::UnterminatedArith => "unterminated arithmetic expansion",
         };
         f.write_str(message)
     }
@@ -63,6 +66,10 @@ pub enum Part {
     Subst(String),
     /// Double-quoted `$(...)`; the output is substituted literally.
     QSubst(String),
+    /// Unquoted `$((...))` arithmetic; holds the raw expression.
+    Arith(String),
+    /// Double-quoted `$((...))`.
+    QArith(String),
     /// Output of an already-executed unquoted substitution (executor fills
     /// this in); word-split and globbed like a variable.
     SubstOut(String),
@@ -255,6 +262,15 @@ fn lex_word(chars: &[char], mut i: usize) -> Result<(Vec<Part>, usize), ParseErr
                                 None => return Err(ParseError::UnterminatedQuote('"')),
                             }
                         }
+                        Some(&'$')
+                            if chars.get(i + 1) == Some(&'(')
+                                && chars.get(i + 2) == Some(&'(') =>
+                        {
+                            flush_all!();
+                            let (body, next) = lex_arith(chars, i + 3)?;
+                            parts.push(Part::QArith(body));
+                            i = next;
+                        }
                         Some(&'$') if chars.get(i + 1) == Some(&'(') => {
                             flush_all!();
                             let (body, next) = lex_subst(chars, i + 1)?;
@@ -289,6 +305,12 @@ fn lex_word(chars: &[char], mut i: usize) -> Result<(Vec<Part>, usize), ParseErr
                         }
                     }
                 }
+            }
+            '$' if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') => {
+                flush_all!();
+                let (body, next) = lex_arith(chars, i + 3)?;
+                parts.push(Part::Arith(body));
+                i = next;
             }
             '$' if chars.get(i + 1) == Some(&'(') => {
                 flush_all!();
@@ -431,6 +453,41 @@ fn lex_backtick(chars: &[char], start: usize) -> Result<(String, usize), ParseEr
     Err(ParseError::UnterminatedSubst)
 }
 
+/// Body of a `$((...))` arithmetic expansion; `start` points just past the
+/// opening `((`. Returns the raw expression and the index just past the
+/// closing `))`. Inner parens must balance; the first `)` at depth zero
+/// must be followed by the second one.
+fn lex_arith(chars: &[char], start: usize) -> Result<(String, usize), ParseError> {
+    let mut depth = 0;
+    let mut body = String::new();
+    let mut i = start;
+    while let Some(&c) = chars.get(i) {
+        match c {
+            '(' => {
+                depth += 1;
+                body.push(c);
+                i += 1;
+            }
+            ')' if depth == 0 => {
+                if chars.get(i + 1) == Some(&')') {
+                    return Ok((body, i + 2));
+                }
+                return Err(ParseError::UnterminatedArith);
+            }
+            ')' => {
+                depth -= 1;
+                body.push(c);
+                i += 1;
+            }
+            _ => {
+                body.push(c);
+                i += 1;
+            }
+        }
+    }
+    Err(ParseError::UnterminatedArith)
+}
+
 /// Variable name after `$`: `[A-Za-z_][A-Za-z0-9_]*` or `?`.
 fn lex_var(chars: &[char], start: usize) -> (Option<String>, usize) {
     if chars.get(start) == Some(&'?') {
@@ -538,6 +595,17 @@ mod tests {
         assert_eq!(word("'`echo hi`'"), vec![Part::QLit("`echo hi`".into())]);
         assert_eq!(word("`echo \\`x\\``"), vec![Part::Subst("echo `x`".into())]);
         assert_eq!(lex("`echo hi"), Err(ParseError::UnterminatedSubst));
+    }
+
+    #[test]
+    fn arithmetic_expansion() {
+        assert_eq!(word("$((1 + 2))"), vec![Part::Arith("1 + 2".into())]);
+        assert_eq!(word("\"$((1+1))\""), vec![Part::QArith("1+1".into())]);
+        // Inner parens balance.
+        assert_eq!(word("$(( (a) * 2 ))"), vec![Part::Arith(" (a) * 2 ".into())]);
+        // `$( (` without the double paren is still command substitution.
+        assert_eq!(word("$( (ls) )"), vec![Part::Subst(" (ls) ".into())]);
+        assert_eq!(lex("$((1+1"), Err(ParseError::UnterminatedArith));
     }
 
     #[test]

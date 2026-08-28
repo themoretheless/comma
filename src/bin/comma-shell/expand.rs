@@ -1,4 +1,5 @@
-//! Word expansion: `$VAR`, `${...}` forms, `$?`, leading `~`, `$(...)` and
+//! Word expansion: `$VAR`, `${...}` forms (incl. `${VAR#pat}`/`${VAR%pat}`
+//! and nested words), `$((...))` arithmetic, `$?`, leading `~`, `$(...)` and
 //! `` `...` `` output, word splitting and globbing (`*`, `?`, `[...]` with
 //! `[!]`/`[^]` negation, `**` recursively), in POSIX order: expand → split →
 //! glob. Command substitution itself (`Part::Subst`/`QSubst`) is resolved by
@@ -64,6 +65,8 @@ fn expand_segments(
             Part::QParam(body) => {
                 segments.push(Seg::Quoted(expand_param(body, env, last_status)))
             }
+            Part::Arith(body) => segments.push(Seg::Expanded(eval_arith(body, env))),
+            Part::QArith(body) => segments.push(Seg::Quoted(eval_arith(body, env))),
             Part::Tilde => {
                 if let Some(home) = env.get("HOME") {
                     segments.push(Seg::Quoted(home.clone()));
@@ -120,7 +123,162 @@ fn expand_param(body: &str, env: &HashMap<String, String>, last_status: i32) -> 
         '-' if !use_value => expand_braced_word(word, env, last_status),
         '-' => val.unwrap_or_default(),
         '+' if use_value => expand_braced_word(word, env, last_status),
+        // `${VAR#pat}`/`${VAR##pat}` strip a prefix, `${VAR%pat}`/
+        // `${VAR%%pat}` a suffix.
+        '#' | '%' if !test_null => {
+            let (longest, word) = match word.strip_prefix(op) {
+                Some(word) => (true, word),
+                None => (false, word),
+            };
+            let pattern = expand_braced_word(word, env, last_status);
+            trim_pattern(&val.unwrap_or_default(), &pattern, op == '#', longest)
+        }
         _ => String::new(),
+    }
+}
+
+/// `${VAR#word}`/`${VAR%word}`: strip the shortest (or longest, with `##` /
+/// `%%`) prefix/suffix matching the glob pattern `word`; no match leaves the
+/// value unchanged.
+fn trim_pattern(value: &str, pattern: &str, prefix: bool, longest: bool) -> String {
+    let Ok(pattern) = glob::Pattern::new(pattern) else {
+        return value.to_string();
+    };
+    // Patterns here match a string, not a path: `/` and dots are ordinary.
+    let options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+    // Char-boundary offsets, shortest match first for the tested side.
+    let bounds: Vec<usize> =
+        value.char_indices().map(|(i, _)| i).chain(std::iter::once(value.len())).collect();
+    let ascending = prefix != longest;
+    let order: Box<dyn Iterator<Item = &usize>> = if ascending {
+        Box::new(bounds.iter())
+    } else {
+        Box::new(bounds.iter().rev())
+    };
+    for &len in order {
+        let (head, tail) = value.split_at(len);
+        if pattern.matches_with(if prefix { head } else { tail }, options) {
+            return (if prefix { tail } else { head }).to_string();
+        }
+    }
+    value.to_string()
+}
+
+/// Evaluate a `$((...))` body: i64 arithmetic with `+ - * / %`, unary
+/// `-`/`+`, parentheses and variables (bare or `$name`; unset or
+/// non-numeric variables count as 0). Any error — syntax, division by
+/// zero, overflow — yields an empty expansion.
+fn eval_arith(body: &str, env: &HashMap<String, String>) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let mut parser = ArithParser { chars: &chars, pos: 0, env };
+    match parser.expr().filter(|_| parser.at_end()) {
+        Some(value) => value.to_string(),
+        None => String::new(),
+    }
+}
+
+struct ArithParser<'a> {
+    chars: &'a [char],
+    pos: usize,
+    env: &'a HashMap<String, String>,
+}
+
+impl ArithParser<'_> {
+    fn skip_ws(&mut self) {
+        while self.chars.get(self.pos).is_some_and(|c| c.is_whitespace()) {
+            self.pos += 1;
+        }
+    }
+
+    fn at_end(&mut self) -> bool {
+        self.skip_ws();
+        self.pos == self.chars.len()
+    }
+
+    fn eat(&mut self, c: char) -> bool {
+        self.skip_ws();
+        if self.chars.get(self.pos) == Some(&c) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expr(&mut self) -> Option<i64> {
+        let mut lhs = self.term()?;
+        loop {
+            if self.eat('+') {
+                lhs = lhs.checked_add(self.term()?)?;
+            } else if self.eat('-') {
+                lhs = lhs.checked_sub(self.term()?)?;
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+
+    fn term(&mut self) -> Option<i64> {
+        let mut lhs = self.factor()?;
+        loop {
+            if self.eat('*') {
+                lhs = lhs.checked_mul(self.factor()?)?;
+            } else if self.eat('/') {
+                lhs = lhs.checked_div(self.factor()?)?;
+            } else if self.eat('%') {
+                lhs = lhs.checked_rem(self.factor()?)?;
+            } else {
+                return Some(lhs);
+            }
+        }
+    }
+
+    fn factor(&mut self) -> Option<i64> {
+        if self.eat('-') {
+            return self.factor()?.checked_neg();
+        }
+        if self.eat('+') {
+            return self.factor();
+        }
+        if self.eat('(') {
+            let value = self.expr()?;
+            return self.eat(')').then_some(value);
+        }
+        self.number().or_else(|| self.variable())
+    }
+
+    fn number(&mut self) -> Option<i64> {
+        self.skip_ws();
+        let start = self.pos;
+        while self.chars.get(self.pos).is_some_and(|c| c.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        if start == self.pos {
+            return None;
+        }
+        self.chars[start..self.pos].iter().collect::<String>().parse().ok()
+    }
+
+    fn variable(&mut self) -> Option<i64> {
+        self.skip_ws();
+        let mut pos = self.pos;
+        if self.chars.get(pos) == Some(&'$') {
+            pos += 1;
+        }
+        let start = pos;
+        while self.chars.get(pos).is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') {
+            pos += 1;
+        }
+        if pos == start {
+            return None;
+        }
+        let name: String = self.chars[start..pos].iter().collect();
+        self.pos = pos;
+        Some(self.env.get(&name).and_then(|v| v.trim().parse().ok()).unwrap_or(0))
     }
 }
 
@@ -547,6 +705,37 @@ mod tests {
             glob_word(&[Part::Var("X".into()), Part::Lit("post".into())], &env),
             ["a", "post"]
         );
+    }
+
+    #[test]
+    fn arithmetic() {
+        let env = env_with(&[("X", "5")]);
+        let a = |body: &str| vec![Part::Arith(body.into())];
+        assert_eq!(expand_word(&a("1 + 2 * 3"), &env, 0), "7");
+        assert_eq!(expand_word(&a("(1 + 2) * 3"), &env, 0), "9");
+        // Bare and `$`-prefixed variables; unset counts as 0.
+        assert_eq!(expand_word(&a("X * 2"), &env, 0), "10");
+        assert_eq!(expand_word(&a("$X + MISSING"), &env, 0), "5");
+        assert_eq!(expand_word(&a("-X"), &env, 0), "-5");
+        assert_eq!(expand_word(&a("10 % 3"), &env, 0), "1");
+        assert_eq!(expand_word(&a("10 / 3"), &env, 0), "3");
+        // Errors expand to nothing: division by zero, trailing operator.
+        assert_eq!(expand_word(&a("1 / 0"), &env, 0), "");
+        assert_eq!(expand_word(&a("1 +"), &env, 0), "");
+    }
+
+    #[test]
+    fn pattern_removal_forms() {
+        let env = env_with(&[("V", "path/to/file.txt")]);
+        let p = |body: &str| vec![Part::Param(body.into())];
+        assert_eq!(expand_word(&p("V#*/"), &env, 0), "to/file.txt");
+        assert_eq!(expand_word(&p("V##*/"), &env, 0), "file.txt");
+        assert_eq!(expand_word(&p("V%/*"), &env, 0), "path/to");
+        assert_eq!(expand_word(&p("V%%/*"), &env, 0), "path");
+        // No match: the value stays; the pattern word expands.
+        assert_eq!(expand_word(&p("V#z*"), &env, 0), "path/to/file.txt");
+        let env = env_with(&[("V", "file.tar.gz"), ("E", "*.gz")]);
+        assert_eq!(expand_word(&p("V%$E"), &env, 0), "file.tar");
     }
 
     /// Expand a command line in `dir` and return the resulting argv.
