@@ -1,8 +1,8 @@
-//! Word expansion: `$VAR`, `$?`, leading `~`, `$(...)` output, word
-//! splitting and globbing (`*`, `?`, `[...]`, `**` recursively), in POSIX
-//! order: expand → split → glob. Command substitution itself
-//! (`Part::Subst`/`QSubst`) is resolved by the executor before expansion
-//! (see `exec::substitute_pipeline`).
+//! Word expansion: `$VAR`, `${...}` forms, `$?`, leading `~`, `$(...)` and
+//! `` `...` `` output, word splitting and globbing (`*`, `?`, `[...]` with
+//! `[!]`/`[^]` negation, `**` recursively), in POSIX order: expand → split →
+//! glob. Command substitution itself (`Part::Subst`/`QSubst`) is resolved by
+//! the executor before expansion (see `exec::substitute_pipeline`).
 
 use std::collections::HashMap;
 
@@ -64,6 +64,12 @@ fn expand_segments(
             Part::QLit(text) => segments.push(Seg::Quoted(text.clone())),
             Part::Var(name) => segments.push(Seg::Expanded(var(name))),
             Part::QVar(name) => segments.push(Seg::Quoted(var(name))),
+            Part::Param(body) => {
+                segments.push(Seg::Expanded(expand_param(body, env, last_status)))
+            }
+            Part::QParam(body) => {
+                segments.push(Seg::Quoted(expand_param(body, env, last_status)))
+            }
             Part::Tilde => {
                 if let Some(home) = env.get("HOME") {
                     segments.push(Seg::Quoted(home.clone()));
@@ -75,6 +81,49 @@ fn expand_segments(
         }
     }
     segments
+}
+
+/// Evaluate a `${...}` body: plain `${NAME}`, length `${#NAME}`, and the
+/// POSIX default/alternative forms `${NAME:-word}`, `${NAME-word}`,
+/// `${NAME:+word}`, `${NAME+word}` (`NAME` may be `?`). The word is used
+/// verbatim, without nested expansion. Unknown forms expand to nothing.
+fn expand_param(body: &str, env: &HashMap<String, String>, last_status: i32) -> String {
+    let value = |name: &str| -> Option<String> {
+        if name == "?" { Some(last_status.to_string()) } else { env.get(name).cloned() }
+    };
+    if let Some(name) = body.strip_prefix('#') {
+        return value(name).map_or_else(|| "0".into(), |v| v.chars().count().to_string());
+    }
+    // The name is the longest valid identifier prefix; the rest is the
+    // operator and its word.
+    let name_len = body
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_alphanumeric() || matches!(c, '_' | '?'))
+        .map(|(i, c)| i + c.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let (name, rest) = body.split_at(name_len);
+    if name.is_empty() {
+        return String::new();
+    }
+    if rest.is_empty() {
+        return value(name).unwrap_or_default();
+    }
+    // `:-`/`:+` test "unset or null"; bare `-`/`+` test only "unset".
+    let (test_null, rest) = match rest.strip_prefix(':') {
+        Some(rest) => (true, rest),
+        None => (false, rest),
+    };
+    let op = rest.chars().next().unwrap_or(' ');
+    let word = &rest[op.len_utf8()..];
+    let val = value(name);
+    let use_value = if test_null { val.as_ref().is_some_and(|v| !v.is_empty()) } else { val.is_some() };
+    match op {
+        '-' if !use_value => word.to_string(),
+        '-' => val.unwrap_or_default(),
+        '+' if use_value => word.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// IFS whitespace for word splitting: `$IFS` or the POSIX default.
@@ -162,7 +211,10 @@ fn glob_field(field: &Field) -> Vec<String> {
     if !field.has_meta {
         return vec![field.text.clone()];
     }
-    let mut matches: Vec<String> = glob::glob_with(&field.pattern, GLOB_OPTIONS)
+    // The glob crate negates classes with `!`; accept the regex-style `[^...]`
+    // too. Quoted text is already escaped, so a raw `[^` is always a class.
+    let pattern = field.pattern.replace("[^", "[!");
+    let mut matches: Vec<String> = glob::glob_with(&pattern, GLOB_OPTIONS)
         .map(|paths| {
             paths
                 .flatten()
@@ -282,6 +334,32 @@ mod tests {
         assert_eq!(glob_word(&[Part::QLit("a b".into())], &env), ["a b"]);
     }
 
+    #[test]
+    fn braced_parameter_forms() {
+        let env = env_with(&[("FOO", "bar"), ("EMPTY", "")]);
+        let p = |body: &str| vec![Part::Param(body.into())];
+        assert_eq!(expand_word(&p("FOO"), &env, 0), "bar");
+        assert_eq!(expand_word(&p("MISSING"), &env, 0), "");
+        assert_eq!(expand_word(&p("?"), &env, 7), "7");
+        assert_eq!(expand_word(&p("#FOO"), &env, 0), "3");
+        assert_eq!(expand_word(&p("#MISSING"), &env, 0), "0");
+        // `:-` defaults on unset-or-null, `-` only on unset.
+        assert_eq!(expand_word(&p("FOO:-def"), &env, 0), "bar");
+        assert_eq!(expand_word(&p("MISSING:-def"), &env, 0), "def");
+        assert_eq!(expand_word(&p("EMPTY:-def"), &env, 0), "def");
+        assert_eq!(expand_word(&p("EMPTY-def"), &env, 0), "");
+        assert_eq!(expand_word(&p("MISSING-def"), &env, 0), "def");
+        // `:+`/`+` substitute the alternative when the variable is set.
+        assert_eq!(expand_word(&p("FOO:+alt"), &env, 0), "alt");
+        assert_eq!(expand_word(&p("EMPTY:+alt"), &env, 0), "");
+        assert_eq!(expand_word(&p("EMPTY+alt"), &env, 0), "alt");
+        assert_eq!(expand_word(&p("MISSING+alt"), &env, 0), "");
+        // Quoted expands literally, unquoted splits like `$VAR`.
+        let env = env_with(&[("X", "a b")]);
+        assert_eq!(glob_word(&[Part::QParam("X".into())], &env), ["a b"]);
+        assert_eq!(glob_word(&[Part::Param("X".into())], &env), ["a", "b"]);
+    }
+
     /// Expand a command line in `dir` and return the resulting argv.
     /// Callers must hold `CWD_LOCK`: this changes the process cwd.
     fn expand_in(dir: &std::path::Path, line: &str) -> Vec<String> {
@@ -333,8 +411,10 @@ mod tests {
         assert_eq!(expand_in(&dir, "**/*.toml"), vec!["sub/d.toml", "sub/deep/e.toml"]);
         assert_eq!(expand_in(&dir, "?.rs"), vec!["a.rs", "b.rs"]);
         assert_eq!(expand_in(&dir, "[ab].rs"), vec!["a.rs", "b.rs"]);
-        // Negation is `[!...]` in the glob crate (not `[^...]`).
+        // Negation is `[!...]` in the glob crate; regex-style `[^...]` is
+        // accepted too.
         assert_eq!(expand_in(&dir, "[!a]*.rs"), vec!["b.rs"]);
+        assert_eq!(expand_in(&dir, "[^a]*.rs"), vec!["b.rs"]);
         // Glob in the middle of a word.
         assert_eq!(expand_in(&dir, "sub/*.toml"), vec!["sub/d.toml"]);
         std::fs::remove_dir_all(&dir).ok();

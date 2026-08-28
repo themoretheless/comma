@@ -16,6 +16,8 @@ pub enum ParseError {
     MissingRedirectTarget,
     /// A `$(` was never closed.
     UnterminatedSubst,
+    /// A `${` was never closed.
+    UnterminatedParam,
 }
 
 impl std::fmt::Display for ParseError {
@@ -29,6 +31,7 @@ impl std::fmt::Display for ParseError {
             ParseError::ExpectedCommand => "expected a command",
             ParseError::MissingRedirectTarget => "missing redirect target",
             ParseError::UnterminatedSubst => "unterminated command substitution",
+            ParseError::UnterminatedParam => "unterminated parameter expansion",
         };
         f.write_str(message)
     }
@@ -48,6 +51,11 @@ pub enum Part {
     Var(String),
     /// Double-quoted variable reference: expands literally.
     QVar(String),
+    /// Unquoted `${...}` parameter expansion; holds the raw inner expression
+    /// (`NAME`, `#NAME`, `NAME:-word`, ...). Expands like [`Part::Var`].
+    Param(String),
+    /// Double-quoted `${...}`: expands like [`Part::QVar`].
+    QParam(String),
     /// Leading unquoted `~`.
     Tilde,
     /// Unquoted `$(...)` command substitution; holds the raw inner command
@@ -253,6 +261,18 @@ fn lex_word(chars: &[char], mut i: usize) -> Result<(Vec<Part>, usize), ParseErr
                             parts.push(Part::QSubst(body));
                             i = next;
                         }
+                        Some(&'$') if chars.get(i + 1) == Some(&'{') => {
+                            flush_all!();
+                            let (body, next) = lex_braced(chars, i + 2)?;
+                            parts.push(Part::QParam(body));
+                            i = next;
+                        }
+                        Some(&'`') => {
+                            flush_all!();
+                            let (body, next) = lex_backtick(chars, i + 1)?;
+                            parts.push(Part::QSubst(body));
+                            i = next;
+                        }
                         Some(&'$') => {
                             flush_all!();
                             i += 1;
@@ -273,6 +293,18 @@ fn lex_word(chars: &[char], mut i: usize) -> Result<(Vec<Part>, usize), ParseErr
             '$' if chars.get(i + 1) == Some(&'(') => {
                 flush_all!();
                 let (body, next) = lex_subst(chars, i + 1)?;
+                parts.push(Part::Subst(body));
+                i = next;
+            }
+            '$' if chars.get(i + 1) == Some(&'{') => {
+                flush_all!();
+                let (body, next) = lex_braced(chars, i + 2)?;
+                parts.push(Part::Param(body));
+                i = next;
+            }
+            '`' => {
+                flush_all!();
+                let (body, next) = lex_backtick(chars, i + 1)?;
                 parts.push(Part::Subst(body));
                 i = next;
             }
@@ -341,6 +373,43 @@ fn lex_subst(chars: &[char], start: usize) -> Result<(String, usize), ParseError
                         }
                     }
                 }
+            }
+            _ => {
+                body.push(c);
+                i += 1;
+            }
+        }
+    }
+    Err(ParseError::UnterminatedSubst)
+}
+
+/// Body of a `${...}` parameter expansion; `start` points just past `{`.
+/// Returns the raw inner text and the index just past `}`. Braces don't
+/// nest: the first `}` closes the expansion.
+fn lex_braced(chars: &[char], start: usize) -> Result<(String, usize), ParseError> {
+    let mut body = String::new();
+    let mut i = start;
+    while let Some(&c) = chars.get(i) {
+        if c == '}' {
+            return Ok((body, i + 1));
+        }
+        body.push(c);
+        i += 1;
+    }
+    Err(ParseError::UnterminatedParam)
+}
+
+/// Body of a `` `...` `` substitution; `start` points just past the opening
+/// backtick. A `` \` `` escape embeds a literal backtick.
+fn lex_backtick(chars: &[char], start: usize) -> Result<(String, usize), ParseError> {
+    let mut body = String::new();
+    let mut i = start;
+    while let Some(&c) = chars.get(i) {
+        match c {
+            '`' => return Ok((body, i + 1)),
+            '\\' if chars.get(i + 1) == Some(&'`') => {
+                body.push('`');
+                i += 2;
             }
             _ => {
                 body.push(c);
@@ -437,6 +506,26 @@ mod tests {
     fn escapes() {
         assert_eq!(word("a\\ b"), vec![Part::Lit("a b".into())]);
         assert_eq!(word("\"a\\\"b\""), vec![Part::QLit("a\"b".into())]);
+    }
+
+    #[test]
+    fn parameter_expansion() {
+        assert_eq!(word("${FOO}"), vec![Part::Param("FOO".into())]);
+        assert_eq!(word("x${FOO:-d}"), vec![Part::Lit("x".into()), Part::Param("FOO:-d".into())]);
+        assert_eq!(word("\"${#FOO}\""), vec![Part::QParam("#FOO".into())]);
+        // Single quotes shield the expansion.
+        assert_eq!(word("'${FOO}'"), vec![Part::QLit("${FOO}".into())]);
+        assert_eq!(lex("${FOO"), Err(ParseError::UnterminatedParam));
+    }
+
+    #[test]
+    fn backtick_substitution() {
+        assert_eq!(word("`echo hi`"), vec![Part::Subst("echo hi".into())]);
+        assert_eq!(word("\"`echo hi`\""), vec![Part::QSubst("echo hi".into())]);
+        // Single quotes shield backticks; `\`` embeds a literal one.
+        assert_eq!(word("'`echo hi`'"), vec![Part::QLit("`echo hi`".into())]);
+        assert_eq!(word("`echo \\`x\\``"), vec![Part::Subst("echo `x`".into())]);
+        assert_eq!(lex("`echo hi"), Err(ParseError::UnterminatedSubst));
     }
 
     #[test]

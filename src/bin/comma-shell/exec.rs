@@ -1416,4 +1416,20 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "data\n");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn backticks_and_braced_params_execute() {
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        let dir = temp_dir("backtick");
+        let out = dir.join("out.txt");
+        // Backticks substitute like $(...).
+        let line = format!("echo `echo nested` > {}", out.display());
+        assert_eq!(run(&mut shell, &line), 0);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "nested\n");
+        // ${...} forms go through export/parameter expansion.
+        let line = format!("export X=hello; echo ${{X}} ${{MISSING:-def}} > {}", out.display());
+        assert_eq!(run(&mut shell, &line), 0);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "hello def\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
