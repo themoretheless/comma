@@ -1,7 +1,9 @@
 //! Parser: tokens -> AST (Script -> AndOr -> Pipeline -> Command).
 
 pub use crate::lexer::ParseError;
-use crate::lexer::{self, Part, Token};
+use crate::lexer::{Part, Token};
+#[cfg(test)]
+use crate::lexer;
 
 /// A whole command line: `AndOr` chains separated by `;`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,8 +49,15 @@ pub enum Redirect {
     ErrOut { target: Vec<Part>, append: bool },
 }
 
+/// Test-only shorthand: lex + parse. Production code goes through
+/// `exec::parse_line`, which splices aliases between the two phases.
+#[cfg(test)]
 pub fn parse(input: &str) -> Result<Script, ParseError> {
-    let tokens = lexer::lex(input)?;
+    parse_tokens(lexer::lex(input)?)
+}
+
+/// Parse an already-lexed token stream (e.g. after alias expansion).
+pub fn parse_tokens(tokens: Vec<Token>) -> Result<Script, ParseError> {
     let mut parser = Parser { tokens, pos: 0 };
     parser.script()
 }

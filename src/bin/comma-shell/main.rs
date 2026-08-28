@@ -211,7 +211,7 @@ fn run_rc(shell: &mut Shell, path: &Path) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        match parser::parse(line) {
+        match exec::parse_line(shell, line) {
             Ok(script) => {
                 exec::execute_script(shell, &script);
             }
@@ -261,7 +261,7 @@ fn main() {
                 }
                 let _ = rl.add_history_entry(line);
                 shell.history.push(line.to_string());
-                match parser::parse(line) {
+                match exec::parse_line(&shell, line) {
                     Ok(script) => {
                         exec::execute_script(&mut shell, &script);
                     }

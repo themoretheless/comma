@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as Proc, Stdio};
 
 use crate::expand;
-use crate::lexer::Part;
-use crate::parser::{AndOr, Command, Connector, Pipeline, Redirect, Script};
+use crate::lexer::{Part, Token};
+use crate::parser::{self, AndOr, Command, Connector, Pipeline, Redirect, Script};
 
 /// State of a tracked job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,8 +329,7 @@ struct CmdOutcome {
 fn execute_pipeline(shell: &mut Shell, pipeline: &Pipeline) -> i32 {
     debug_assert!(!pipeline.cmds.is_empty(), "parser never yields empty pipelines");
 
-    // Aliases first (their values may contain substitutions), then $(...).
-    let pipeline = &expand_aliases(shell, pipeline);
+    // Aliases are already expanded at parse time (see `parse_line`).
     // Resolve $(...) substitutions before anything inspects argv.
     let pipeline = &substitute_pipeline(shell, pipeline);
 
@@ -449,59 +448,72 @@ fn write_out(shell: &mut Shell, bytes: &[u8]) {
     }
 }
 
-/// Clone `pipeline` with aliases expanded in command position: if the first
-/// literal word of a command names an alias, the alias value is re-lexed and
-/// its words are spliced in front of the remaining arguments. Chained
-/// aliases resolve recursively; `visited` stops self-referential loops.
-/// Alias values containing operators are left unexpanded (only plain word
-/// prefixes are supported).
-fn expand_aliases(shell: &Shell, pipeline: &Pipeline) -> Pipeline {
-    let mut pipeline = pipeline.clone();
-    if shell.aliases.is_empty() {
-        return pipeline;
-    }
-    for cmd in &mut pipeline.cmds {
-        expand_alias_cmd(&shell.aliases, cmd, &mut Vec::new());
-    }
-    pipeline
+/// Parse `line` into a script, expanding aliases at the token level first:
+/// a literal word in command position that names an alias is replaced by the
+/// lexed tokens of its value — operators included, so `alias x='a | b'`
+/// forms a real pipeline and `alias y='a; b'` a real command list. The
+/// value's first word is itself in command position (chained aliases);
+/// `visited` stops self-referential loops. A value that fails to lex is
+/// left unexpanded.
+pub fn parse_line(shell: &Shell, line: &str) -> Result<Script, crate::lexer::ParseError> {
+    let tokens = crate::lexer::lex(line)?;
+    parser::parse_tokens(expand_alias_tokens(&shell.aliases, tokens, &mut Vec::new()))
 }
 
-fn expand_alias_cmd(
+fn expand_alias_tokens(
     aliases: &HashMap<String, String>,
-    cmd: &mut Command,
+    tokens: Vec<Token>,
     visited: &mut Vec<String>,
-) {
-    let name = match cmd.argv.first().map(Vec::as_slice) {
-        Some([Part::Lit(name)]) => name.clone(),
-        _ => return,
-    };
-    if visited.contains(&name) {
-        return;
+) -> Vec<Token> {
+    if aliases.is_empty() {
+        return tokens;
     }
-    let Some(value) = aliases.get(&name) else {
-        return;
-    };
-    let Ok(tokens) = crate::lexer::lex(value) else {
-        return;
-    };
-    let mut words = Vec::new();
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut command_position = true;
+    let mut expect_operand = false; // the next word is a redirect target
     for token in tokens {
         match token {
-            crate::lexer::Token::Word(parts) => words.push(parts),
-            // Operators in an alias value: not supported, leave unexpanded.
-            _ => return,
+            Token::Out { .. } | Token::ErrOut { .. } | Token::In => {
+                expect_operand = true;
+                out.push(token);
+            }
+            Token::Pipe | Token::Semi | Token::And | Token::Or | Token::Amp => {
+                command_position = true;
+                out.push(token);
+            }
+            Token::Word(parts) if expect_operand => {
+                expect_operand = false;
+                out.push(Token::Word(parts));
+            }
+            Token::Word(parts) => {
+                let alias = match (command_position, parts.as_slice()) {
+                    (true, [Part::Lit(name)]) if !visited.contains(name) => {
+                        aliases.get(name).map(|value| (name.clone(), value.clone()))
+                    }
+                    _ => None,
+                };
+                match alias {
+                    Some((name, value)) => {
+                        visited.push(name);
+                        let value_tokens = crate::lexer::lex(&value)
+                            .map(|tokens| expand_alias_tokens(aliases, tokens, visited))
+                            .unwrap_or_default();
+                        visited.pop();
+                        // An empty value removes the word; a value ending in
+                        // an operator puts the next word in command position.
+                        command_position =
+                            value_tokens.last().is_none_or(|t| !matches!(t, Token::Word(_)));
+                        out.extend(value_tokens);
+                    }
+                    None => {
+                        command_position = false;
+                        out.push(Token::Word(parts));
+                    }
+                }
+            }
         }
     }
-    if words.is_empty() {
-        return;
-    }
-    visited.push(name);
-    let mut argv = words;
-    argv.extend(cmd.argv.drain(1..));
-    cmd.argv = argv;
-    // The spliced first word may itself be an alias.
-    expand_alias_cmd(aliases, cmd, visited);
-    visited.pop();
+    out
 }
 
 /// Clone `pipeline` with every substitution part executed and replaced by
@@ -550,7 +562,7 @@ fn substitute_word(shell: &mut Shell, word: &mut [Part]) {
 /// command's status is unaffected. `exit` inside a substitution does not
 /// leave the sub-shell.
 fn run_substitution(shell: &mut Shell, line: &str) -> String {
-    let Ok(script) = crate::parser::parse(line) else {
+    let Ok(script) = parse_line(shell, line) else {
         eprintln!("comma-shell: $({line}): parse error");
         return String::new();
     };
@@ -1099,11 +1111,10 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser;
 
     /// Run a command line and return its exit status.
     fn run(shell: &mut Shell, line: &str) -> i32 {
-        let script = parser::parse(line).unwrap();
+        let script = parse_line(shell, line).unwrap();
         execute_script(shell, &script)
     }
 
@@ -1325,11 +1336,10 @@ mod tests {
         assert_eq!(done_line(2, 130, "yes | head"), "[2]+ Exit 130  yes | head");
     }
 
-    /// Expand aliases of a parsed command line and return its argv.
+    /// Expand aliases of a command line and return the first command's argv.
     fn alias_argv(shell: &Shell, line: &str) -> Vec<String> {
-        let script = parser::parse(line).unwrap();
-        let pipeline = expand_aliases(shell, &script.seq[0].first);
-        pipeline.cmds[0]
+        let script = parse_line(shell, line).unwrap();
+        script.seq[0].first.cmds[0]
             .argv
             .iter()
             .map(|word| expand::expand_word(word, &shell.env, shell.last_status))
@@ -1344,12 +1354,41 @@ mod tests {
         // Only command position: an argument named like an alias stays.
         assert_eq!(alias_argv(&shell, "echo ll"), ["echo", "ll"]);
         // Alias in a pipeline stage expands too.
-        let script = parser::parse("ll x | cat").unwrap();
-        let pipeline = expand_aliases(&shell, &script.seq[0].first);
-        assert_eq!(pipeline.cmds.len(), 2);
+        let script = parse_line(&shell, "ll x | cat").unwrap();
+        assert_eq!(script.seq[0].first.cmds.len(), 2);
         // Quoted value with inner quoting survives the re-lex.
         assert_eq!(run(&mut shell, "alias q='echo \"a b\"'"), 0);
         assert_eq!(alias_argv(&shell, "q"), ["echo", "a b"]);
+    }
+
+    #[test]
+    fn alias_value_with_operators_restructures_the_line() {
+        let mut shell = Shell::with_env(Vec::<(String, String)>::new());
+        // A pipe in the value becomes a real pipeline stage; arguments after
+        // the alias land on the value's last word.
+        assert_eq!(run(&mut shell, "alias up='echo a | cat'"), 0);
+        let script = parse_line(&shell, "up x").unwrap();
+        assert_eq!(script.seq[0].first.cmds.len(), 2);
+        let argv: Vec<String> = script.seq[0].first.cmds[1]
+            .argv
+            .iter()
+            .map(|word| expand::expand_word(word, &shell.env, shell.last_status))
+            .collect();
+        assert_eq!(argv, ["cat", "x"]);
+        // `;` in the value splits the line into a command list.
+        assert_eq!(run(&mut shell, "alias two='export A=1; export B=2'"), 0);
+        assert_eq!(run(&mut shell, "two"), 0);
+        assert_eq!(shell.env.get("A").unwrap(), "1");
+        assert_eq!(shell.env.get("B").unwrap(), "2");
+        // End-to-end: a piped alias streams through a redirect (defined on a
+        // previous line, like bash: aliases don't expand mid-line).
+        let dir = temp_dir("aliasop");
+        let out = dir.join("out.txt");
+        assert_eq!(run(&mut shell, "alias p='echo hi | cat'"), 0);
+        let line = format!("p > {}", out.display());
+        assert_eq!(run(&mut shell, &line), 0);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "hi\n");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
