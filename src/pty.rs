@@ -145,6 +145,9 @@ pub(crate) fn spawn(
     let mut cmd = CommandBuilder::new(&shell);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // Tells comma-shell (and anything else that cares) it runs inside the
+    // comma terminal: the prompt stays minimal, the sidebar shows cwd/git.
+    cmd.env("COMMA_TERM", "1");
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }

@@ -1,5 +1,7 @@
 //! Git-aware prompt: `~/path  branch* ❯` (dir cyan, branch magenta, dirty red,
-//! upstream tracking as `↑N` ahead / `↓N` behind).
+//! upstream tracking as `↑N` ahead / `↓N` behind). Inside the comma terminal
+//! (`COMMA_TERM` is set by the PTY spawner) the prompt is just `❯` — the
+//! sidebar already shows cwd and branch.
 
 use std::path::Path;
 use std::process::Command;
@@ -12,6 +14,15 @@ const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
 pub fn render() -> String {
+    render_with(std::env::var_os("COMMA_TERM").is_some())
+}
+
+/// `minimal` (set inside the comma terminal, where the sidebar already
+/// shows cwd and git branch): just the prompt marker.
+fn render_with(minimal: bool) -> String {
+    if minimal {
+        return format!("{CYAN}❯{RESET} ");
+    }
     let cwd = std::env::current_dir().ok();
     let dir_text = cwd.as_deref().map(shortened_cwd).unwrap_or_else(|| "?".into());
     let mut prompt = format!("{CYAN}{dir_text}{RESET}");
@@ -151,6 +162,11 @@ mod tests {
         assert!(segment.contains('*'), "expected dirty marker: {segment}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn minimal_prompt_inside_comma() {
+        assert_eq!(render_with(true), format!("{CYAN}❯{RESET} "));
     }
 
     #[test]
