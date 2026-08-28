@@ -90,6 +90,12 @@ impl Tab {
         self.cwd_cache.borrow().1.as_deref().map(shorten_home)
     }
 
+    /// Working directory of the shell process (full path, unshortened).
+    pub(crate) fn cwd_path(&self) -> Option<String> {
+        self.poll_cwd();
+        self.cwd_cache.borrow().1.clone()
+    }
+
     /// Git branch of the repository containing the shell's cwd (detached
     /// HEAD shows the short hash), re-polled with the cwd.
     pub(crate) fn git_branch(&self) -> Option<String> {
