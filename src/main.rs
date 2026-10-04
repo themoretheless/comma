@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod input;
+mod palette;
 mod pty;
 mod render;
 mod tab;
