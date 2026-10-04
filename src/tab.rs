@@ -31,12 +31,23 @@ pub(crate) struct Tab {
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// Pid of the shell process; its cwd is shown under the tab label.
     child_pid: Option<i32>,
-    /// Cached cwd/git-branch poll result and when it was taken.
-    cwd_cache: std::cell::RefCell<(Instant, Option<String>, Option<String>)>,
+    /// Cached cwd/git-branch/foreground-command poll and when it was taken.
+    cwd_cache: std::cell::RefCell<Poll>,
     /// Shaped text rows reused on frames without terminal damage.
     render_cache: std::cell::RefCell<render::RowCache>,
     /// Set once the child process has exited; the app removes dead tabs.
     dead: bool,
+    /// Output arrived while the tab was in the background.
+    unseen: bool,
+}
+
+/// One poll of the shell's state, refreshed at most every `CWD_POLL`.
+struct Poll {
+    at: Instant,
+    cwd: Option<String>,
+    branch: Option<String>,
+    /// Name of the foreground program when it isn't the shell itself.
+    running: Option<String>,
 }
 
 impl Tab {
@@ -60,9 +71,15 @@ impl Tab {
             master,
             killer,
             child_pid,
-            cwd_cache: std::cell::RefCell::new((Instant::now() - CWD_POLL, None, None)),
+            cwd_cache: std::cell::RefCell::new(Poll {
+                at: Instant::now() - CWD_POLL,
+                cwd: None,
+                branch: None,
+                running: None,
+            }),
             render_cache: std::cell::RefCell::new(render::RowCache::new()),
             dead: false,
+            unseen: false,
         })
     }
 
@@ -87,30 +104,59 @@ impl Tab {
     /// shell itself, not the program running in the foreground.
     pub(crate) fn cwd(&self) -> Option<String> {
         self.poll_cwd();
-        self.cwd_cache.borrow().1.as_deref().map(shorten_home)
+        self.cwd_cache.borrow().cwd.as_deref().map(shorten_home)
     }
 
     /// Working directory of the shell process (full path, unshortened).
     pub(crate) fn cwd_path(&self) -> Option<String> {
         self.poll_cwd();
-        self.cwd_cache.borrow().1.clone()
+        self.cwd_cache.borrow().cwd.clone()
     }
 
     /// Git branch of the repository containing the shell's cwd (detached
     /// HEAD shows the short hash), re-polled with the cwd.
     pub(crate) fn git_branch(&self) -> Option<String> {
         self.poll_cwd();
-        self.cwd_cache.borrow().2.clone()
+        self.cwd_cache.borrow().branch.clone()
     }
 
     /// Re-poll the shell's cwd and git branch when the cache is stale.
     fn poll_cwd(&self) {
         let mut cache = self.cwd_cache.borrow_mut();
-        if cache.0.elapsed() >= CWD_POLL {
-            cache.0 = Instant::now();
-            cache.1 = self.child_pid.and_then(process_cwd);
-            cache.2 = cache.1.as_deref().and_then(find_git_branch);
+        if cache.at.elapsed() >= CWD_POLL {
+            cache.at = Instant::now();
+            cache.cwd = self.child_pid.and_then(process_cwd);
+            cache.branch = cache.cwd.as_deref().and_then(find_git_branch);
+            cache.running = self
+                .master
+                .process_group_leader()
+                .filter(|&leader| Some(leader) != self.child_pid)
+                .and_then(process_name);
         }
+    }
+
+    /// Short name for the sidebar: the cwd's last component (`~` at home),
+    /// falling back to the terminal title.
+    pub(crate) fn name(&self) -> String {
+        match self.cwd() {
+            Some(cwd) if cwd == "~" || cwd == "/" => cwd,
+            Some(cwd) => cwd.rsplit('/').next().unwrap_or(&cwd).to_string(),
+            None => self.label(),
+        }
+    }
+
+    /// Foreground program other than the shell (e.g. `vim`), if any.
+    pub(crate) fn running(&self) -> Option<String> {
+        self.poll_cwd();
+        self.cwd_cache.borrow().running.clone()
+    }
+
+    pub(crate) fn has_unseen(&self) -> bool {
+        self.unseen
+    }
+
+    pub(crate) fn set_unseen(&mut self, unseen: bool) {
+        self.unseen = unseen;
     }
 
     pub(crate) fn set_title(&mut self, title: Option<String>) {
@@ -179,8 +225,24 @@ fn process_cwd(pid: i32) -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn process_cwd(_pid: i32) -> Option<String> {
-    None
+fn process_cwd(pid: i32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Executable name of process `pid`.
+#[cfg(target_os = "macos")]
+fn process_name(pid: i32) -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a writable buffer of the given length; proc_name
+    // writes at most that many bytes and returns the name length.
+    let len = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (len > 0).then(|| String::from_utf8_lossy(&buf[..len as usize]).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_name(pid: i32) -> Option<String> {
+    let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(name.trim_end().to_string()).filter(|n| !n.is_empty())
 }
 
 /// Shorten a leading `$HOME` to `~` for display.
@@ -240,11 +302,15 @@ mod tests {
         assert_eq!(shorten_home(&format!("{home}x")), format!("{home}x"));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn process_cwd_of_self_is_current_dir() {
         let cwd = process_cwd(std::process::id() as i32).unwrap();
         assert_eq!(cwd, std::env::current_dir().unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn process_name_of_self_is_known() {
+        assert!(process_name(std::process::id() as i32).is_some_and(|n| !n.is_empty()));
     }
 
     /// Temp dir; the caller removes it.

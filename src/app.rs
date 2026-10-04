@@ -83,6 +83,14 @@ fn list_dirs(dir: &str) -> Vec<String> {
     dirs
 }
 
+/// Cut `text` to `max` characters, ending with `…` when shortened.
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    text.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+}
+
 /// Single-quote a word for the shell (`'` becomes `'\''`).
 fn shell_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', r"'\''"))
@@ -140,6 +148,7 @@ impl CommaApp {
     /// Apply events coming from the terminal reader threads.
     fn handle_events(&mut self, ctx: &Context) {
         let mut had_events = false;
+        let active_id = self.tabs.active().map(Tab::id);
         while let Ok((tab_id, event)) = self.event_rx.try_recv() {
             had_events = true;
             let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id() == tab_id) else {
@@ -151,6 +160,7 @@ impl CommaApp {
                 Event::Exit | Event::ChildExit(_) => tab.mark_dead(),
                 Event::PtyWrite(text) => tab.write(text.as_bytes()),
                 Event::ClipboardStore(_, text) => ctx.copy_text(text),
+                Event::Wakeup if Some(tab_id) != active_id => tab.set_unseen(true),
                 _ => {}
             }
         }
@@ -172,7 +182,7 @@ impl CommaApp {
 
     /// Open the command palette over the active tab's tabs and subdirs.
     fn open_palette(&mut self) {
-        let tabs: Vec<String> = self.tabs.iter().map(Tab::label).collect();
+        let tabs: Vec<String> = self.tabs.iter().map(Tab::name).collect();
         let dirs = self.tabs.active().and_then(Tab::cwd_path).map(|d| list_dirs(&d)).unwrap_or_default();
         self.command_palette = Some(Palette::new(&tabs, &dirs));
     }
@@ -425,51 +435,99 @@ impl CommaApp {
         }
     }
 
+    /// Tab list: one row per tab — name, then a dim line with the git
+    /// branch and the foreground program. A dot marks background output;
+    /// the close button only appears on hover.
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {
+        let branch_color = {
+            let rgb = self.palette.indexed[5];
+            egui::Color32::from_rgb(rgb.r, rgb.g, rgb.b)
+        };
+        let accent = {
+            let rgb = self.palette.indexed[6];
+            egui::Color32::from_rgb(rgb.r, rgb.g, rgb.b)
+        };
+        let background = {
+            let rgb = self.palette.background;
+            egui::Color32::from_rgb(rgb.r, rgb.g, rgb.b)
+        };
+        if let Some(tab) = self.tabs.active_mut() {
+            tab.set_unseen(false);
+        }
         egui::Panel::left("tabs")
             .resizable(false)
             .default_size(self.config.sidebar_width)
+            .frame(egui::Frame::NONE.fill(background).inner_margin(egui::Margin::symmetric(8, 0)))
             .show(ui, |ui| {
                 // Clear the traffic-light buttons in the hidden title bar.
-                ui.add_space(28.0);
-                // Info-line colors, matching the shell prompt's cyan/magenta.
-                let cwd_color = {
-                    let rgb = self.palette.indexed[6];
-                    egui::Color32::from_rgb(rgb.r, rgb.g, rgb.b)
-                };
-                let branch_color = {
-                    let rgb = self.palette.indexed[5];
-                    egui::Color32::from_rgb(rgb.r, rgb.g, rgb.b)
-                };
+                ui.add_space(36.0);
                 let mut close = None;
                 let mut switch_to = None;
                 for (index, tab) in self.tabs.iter().enumerate() {
                     let selected = index == self.tabs.active_index();
-                    let mut label = tab.label();
-                    if label.chars().count() > config::MAX_TAB_LABEL {
-                        label =
-                            label.chars().take(config::MAX_TAB_LABEL - 1).collect::<String>() + "…";
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(selected, label).clicked() {
-                            switch_to = Some(index);
+                    let detail = match (tab.git_branch(), tab.running()) {
+                        (Some(branch), Some(cmd)) => Some((Some(branch), Some(cmd))),
+                        (branch, cmd) if branch.is_some() || cmd.is_some() => Some((branch, cmd)),
+                        _ => None,
+                    };
+                    let height = if detail.is_some() { 40.0 } else { 26.0 };
+                    let (rect, response) = ui
+                        .allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+                    let visuals = ui.visuals();
+                    let fill = if selected {
+                        visuals.widgets.active.weak_bg_fill
+                    } else if response.hovered() {
+                        visuals.widgets.hovered.weak_bg_fill
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, 6.0, fill);
+                    let text = if selected { visuals.strong_text_color() } else { visuals.text_color() };
+                    let weak = visuals.weak_text_color();
+                    let left = rect.left() + 10.0;
+                    let name = truncate(&tab.name(), config::MAX_TAB_LABEL);
+                    painter.text(
+                        egui::pos2(left, rect.top() + 13.0),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        egui::FontId::proportional(13.0),
+                        text,
+                    );
+                    if let Some((branch, cmd)) = detail {
+                        let mut job = egui::text::LayoutJob::default();
+                        let small = egui::FontId::proportional(11.0);
+                        if let Some(branch) = branch {
+                            job.append(&truncate(&branch, 18), 0.0, egui::TextFormat::simple(small.clone(), branch_color));
                         }
-                        if ui.small_button("×").clicked() {
+                        if let Some(cmd) = cmd {
+                            let sep = if job.text.is_empty() { "" } else { "  " };
+                            job.append(&format!("{sep}▸ {cmd}"), 0.0, egui::TextFormat::simple(small, weak));
+                        }
+                        let galley = ui.fonts_mut(|f| f.layout_job(job));
+                        painter.galley(egui::pos2(left, rect.top() + 21.0), galley, weak);
+                    }
+                    let right = egui::pos2(rect.right() - 12.0, rect.top() + 13.0);
+                    if response.hovered() || ui.rect_contains_pointer(rect) {
+                        let close_rect = egui::Rect::from_center_size(right, Vec2::splat(16.0));
+                        let over = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| close_rect.contains(p));
+                        painter.text(
+                            right,
+                            egui::Align2::CENTER_CENTER,
+                            "×",
+                            egui::FontId::proportional(14.0),
+                            if over { text } else { weak },
+                        );
+                        if over && response.clicked() {
                             close = Some(index);
                         }
-                    });
-                    // Second line: the shell's working directory.
-                    if let Some(mut cwd) = tab.cwd() {
-                        if cwd.chars().count() > config::MAX_TAB_LABEL {
-                            cwd = "…".to_string()
-                                + &cwd.chars().skip(cwd.chars().count() - config::MAX_TAB_LABEL + 1).collect::<String>();
-                        }
-                        ui.label(egui::RichText::new(cwd).small().color(cwd_color));
+                    } else if tab.has_unseen() {
+                        painter.circle_filled(right, 3.0, accent);
                     }
-                    // Third line: the git branch of that directory.
-                    if let Some(branch) = tab.git_branch() {
-                        ui.label(egui::RichText::new(format!("⎇ {branch}")).small().color(branch_color));
+                    if response.clicked() && close.is_none() {
+                        switch_to = Some(index);
                     }
+                    ui.add_space(2.0);
                 }
                 if let Some(index) = switch_to {
                     self.tabs.switch(index);
@@ -503,35 +561,76 @@ impl CommaApp {
         let mut close = escape;
         let mut chosen = enter.then(|| palette.chosen()).flatten();
         close |= enter;
+        // Dim the window behind the palette; a click outside closes it.
+        let screen = ctx.content_rect();
+        let backdrop = egui::Area::new(egui::Id::new("palette_backdrop"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Middle)
+            .show(ctx, |ui| {
+                let (rect, response) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(96));
+                response
+            });
+        close |= backdrop.inner.clicked();
         egui::Area::new(egui::Id::new("palette"))
-            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 48.0))
+            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 72.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_width(420.0);
+                let frame = egui::Frame::popup(ui.style())
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::same(8));
+                frame.show(ui, |ui| {
+                    ui.set_width(460.0);
                     let before = palette.query.clone();
                     let edit = ui.add(
                         egui::TextEdit::singleline(&mut palette.query)
-                            .hint_text("Type a command, tab or directory")
+                            .hint_text("Search tabs, folders, actions")
+                            .font(egui::FontId::proportional(16.0))
                             .frame(egui::Frame::NONE)
+                            .margin(egui::Margin::symmetric(6, 6))
                             .desired_width(f32::INFINITY),
                     );
                     edit.request_focus();
                     if palette.query != before {
                         palette.selected = 0;
                     }
-                    ui.separator();
+                    let matches = palette.matches();
+                    if matches.is_empty() {
+                        return;
+                    }
+                    ui.add_space(4.0);
+                    const VISIBLE: usize = 10;
                     let selected = palette.selected;
-                    for (i, item) in palette.matches().into_iter().take(12).enumerate() {
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(i == selected, &item.label).clicked() {
-                                chosen = Some(item.action.clone());
-                                close = true;
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.weak(item.hint);
-                            });
-                        });
+                    let first = selected.saturating_sub(VISIBLE - 1);
+                    for (i, item) in matches.into_iter().enumerate().skip(first).take(VISIBLE) {
+                        let (rect, response) =
+                            ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
+                        let visuals = ui.visuals();
+                        let painter = ui.painter_at(rect);
+                        if i == selected {
+                            painter.rect_filled(rect, 6.0, visuals.selection.bg_fill);
+                        } else if response.hovered() {
+                            painter.rect_filled(rect, 6.0, visuals.widgets.hovered.weak_bg_fill);
+                        }
+                        let text = if i == selected { visuals.strong_text_color() } else { visuals.text_color() };
+                        painter.text(
+                            egui::pos2(rect.left() + 8.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &item.label,
+                            egui::FontId::proportional(14.0),
+                            text,
+                        );
+                        painter.text(
+                            egui::pos2(rect.right() - 8.0, rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            item.hint,
+                            egui::FontId::proportional(12.0),
+                            visuals.weak_text_color(),
+                        );
+                        if response.clicked() {
+                            chosen = Some(item.action.clone());
+                            close = true;
+                        }
                     }
                 });
             });
@@ -660,6 +759,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         // A missing directory lists only `..`.
         assert_eq!(list_dirs("/nonexistent/dir"), [".."]);
+    }
+
+    #[test]
+    fn truncate_adds_ellipsis() {
+        assert_eq!(truncate("comma", 10), "comma");
+        assert_eq!(truncate("abcdef", 4), "abc…");
     }
 
     #[test]
