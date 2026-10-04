@@ -183,6 +183,8 @@ pub(crate) fn spawn(
                         let mut term = reader_term.lock();
                         processor.advance(&mut *term, chunk);
                     }
+                    // New output: repaint, and mark background tabs unseen.
+                    proxy.send_event(Event::Wakeup);
                 }
                 Err(_) => break,
             }
