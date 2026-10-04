@@ -12,6 +12,7 @@ use egui::{Context, Key, Modifiers, Rect, Sense, Vec2};
 use crate::pty::TermSize;
 use crate::tab::Tab;
 use crate::tabs::Tabs;
+use crate::palette::{Action, Palette};
 use crate::{config, input, render};
 
 /// Block-cursor blink: one period visible, one period hidden.
@@ -62,18 +63,8 @@ pub(crate) struct CommaApp {
     scroll_remainder: f32,
     /// Whole wheel lines carried between events for batched mouse reports.
     wheel_report_lines: i32,
-    /// Directory browser open under the active tab, if any.
-    dir_browser: Option<DirBrowser>,
-}
-
-/// Sidebar directory browser: subdirectories of the active tab's cwd, with
-/// `..` first; arrow keys move the selection, Enter `cd`s into it.
-struct DirBrowser {
-    /// The cwd the entries were listed from (relisted when it changes).
-    dir: String,
-    /// Subdirectory names, sorted, with `..` at index 0.
-    entries: Vec<String>,
-    selected: usize,
+    /// Command palette (Cmd+K), when open.
+    command_palette: Option<Palette>,
 }
 
 /// Subdirectory names of `dir`, sorted, hidden ones skipped, `..` first.
@@ -110,7 +101,7 @@ impl CommaApp {
             blink_epoch: Instant::now(),
             scroll_remainder: 0.0,
             wheel_report_lines: 0,
-            dir_browser: None,
+            command_palette: None,
             config,
         };
         app.new_tab(&cc.egui_ctx);
@@ -139,74 +130,11 @@ impl CommaApp {
         self.tabs.close(index);
     }
 
-    /// Toggle the sidebar directory browser for the active tab.
-    fn toggle_browser(&mut self) {
-        if self.dir_browser.take().is_some() {
-            return;
-        }
-        let Some(tab) = self.tabs.active() else {
-            return;
-        };
-        if let Some(dir) = tab.cwd_path() {
-            let entries = list_dirs(&dir);
-            self.dir_browser = Some(DirBrowser { dir, entries, selected: 0 });
-        }
-    }
-
-    /// Relist the browser when the tab's cwd changed (e.g. after a `cd`).
-    fn refresh_browser(&mut self) {
-        let Some(browser) = &mut self.dir_browser else {
-            return;
-        };
-        match self.tabs.active().and_then(Tab::cwd_path) {
-            Some(dir) if dir != browser.dir => {
-                browser.entries = list_dirs(&dir);
-                browser.dir = dir;
-                browser.selected = 0;
-            }
-            Some(_) => {}
-            None => self.dir_browser = None,
-        }
-    }
-
     /// `cd` the active tab's shell into the named subdirectory.
     fn cd_into(&mut self, name: &str) {
         if let Some(tab) = self.tabs.active_mut() {
             tab.write(format!("cd {}\n", shell_quote(name)).as_bytes());
         }
-    }
-
-    /// Arrow/Enter/Escape keys while the directory browser is open; returns
-    /// true when the key was consumed (so it never reaches the PTY).
-    fn handle_browser_key(&mut self, key: Key) -> bool {
-        let Some(browser) = &mut self.dir_browser else {
-            return false;
-        };
-        enum Act {
-            Nothing,
-            Close,
-            Enter(String),
-        }
-        let act = match key {
-            Key::ArrowUp => {
-                browser.selected = browser.selected.saturating_sub(1);
-                Act::Nothing
-            }
-            Key::ArrowDown => {
-                browser.selected =
-                    (browser.selected + 1).min(browser.entries.len().saturating_sub(1));
-                Act::Nothing
-            }
-            Key::Escape => Act::Close,
-            Key::Enter => Act::Enter(browser.entries[browser.selected].clone()),
-            _ => return false,
-        };
-        match act {
-            Act::Nothing => {}
-            Act::Close => self.dir_browser = None,
-            Act::Enter(name) => self.cd_into(&name),
-        }
-        true
     }
 
     /// Apply events coming from the terminal reader threads.
@@ -242,7 +170,14 @@ impl CommaApp {
         }
     }
 
-    /// App-level shortcuts: Cmd+T/W and Cmd+1..9.
+    /// Open the command palette over the active tab's tabs and subdirs.
+    fn open_palette(&mut self) {
+        let tabs: Vec<String> = self.tabs.iter().map(Tab::label).collect();
+        let dirs = self.tabs.active().and_then(Tab::cwd_path).map(|d| list_dirs(&d)).unwrap_or_default();
+        self.command_palette = Some(Palette::new(&tabs, &dirs));
+    }
+
+    /// App-level shortcuts: Cmd+T/W/K and Cmd+1..9.
     fn handle_shortcut(&mut self, ctx: &Context, key: Key) {
         if let Some(index) = input::digit_index(key) {
             self.tabs.switch(index);
@@ -251,19 +186,19 @@ impl CommaApp {
         match key {
             Key::T => self.new_tab(ctx),
             Key::W => self.close_tab(self.tabs.active_index()),
+            Key::K => self.open_palette(),
             _ => {}
         }
     }
 
     fn is_shortcut(key: Key, mods: &Modifiers) -> bool {
-        mods.command && (matches!(key, Key::T | Key::W) || input::digit_index(key).is_some())
+        mods.command && (matches!(key, Key::T | Key::W | Key::K) || input::digit_index(key).is_some())
     }
 
     /// Keyboard, scroll and selection input for the active terminal.
     fn handle_terminal_input(&mut self, ctx: &Context, rect: Rect, response: &egui::Response) {
         let cell_size = self.cell_size;
         let mut shortcuts = Vec::new();
-        let mut browser_keys = Vec::new();
         let mut typed = false;
         let mut scroll_remainder = std::mem::take(&mut self.scroll_remainder);
         let mut wheel_report_lines = std::mem::take(&mut self.wheel_report_lines);
@@ -329,14 +264,6 @@ impl CommaApp {
                     egui::Event::Key { key, pressed: true, modifiers, .. } => {
                         if Self::is_shortcut(key, &modifiers) {
                             shortcuts.push(key);
-                        } else if self.dir_browser.is_some()
-                            && matches!(
-                                key,
-                                Key::ArrowUp | Key::ArrowDown | Key::Enter | Key::Escape
-                            )
-                        {
-                            browser_keys.push(key);
-                            typed = true;
                         } else {
                             typed = true;
                             Self::handle_key(tab, key, modifiers);
@@ -365,9 +292,6 @@ impl CommaApp {
 
         for key in shortcuts {
             self.handle_shortcut(ctx, key);
-        }
-        for key in browser_keys {
-            self.handle_browser_key(key);
         }
 
         // Drop widget focus grabbed by side panel buttons so keystrokes
@@ -519,8 +443,6 @@ impl CommaApp {
                 };
                 let mut close = None;
                 let mut switch_to = None;
-                let mut toggle_browser = false;
-                let mut enter_dir = None;
                 for (index, tab) in self.tabs.iter().enumerate() {
                     let selected = index == self.tabs.active_index();
                     let mut label = tab.label();
@@ -530,11 +452,7 @@ impl CommaApp {
                     }
                     ui.horizontal(|ui| {
                         if ui.selectable_label(selected, label).clicked() {
-                            if selected {
-                                toggle_browser = true;
-                            } else {
-                                switch_to = Some(index);
-                            }
+                            switch_to = Some(index);
                         }
                         if ui.small_button("×").clicked() {
                             close = Some(index);
@@ -552,122 +470,106 @@ impl CommaApp {
                     if let Some(branch) = tab.git_branch() {
                         ui.label(egui::RichText::new(format!("⎇ {branch}")).small().color(branch_color));
                     }
-                    // Directory browser under the active tab.
-                    if selected
-                        && let Some(browser) = &self.dir_browser
-                    {
-                        for (i, name) in browser.entries.iter().enumerate() {
-                            if ui.selectable_label(i == browser.selected, name).clicked() {
-                                enter_dir = Some(name.clone());
-                            }
-                        }
-                    }
                 }
                 if let Some(index) = switch_to {
-                    self.dir_browser = None;
                     self.tabs.switch(index);
                 }
                 if let Some(index) = close {
                     self.close_tab(index);
                 }
-                if toggle_browser {
-                    self.toggle_browser();
-                }
-                if let Some(name) = enter_dir {
-                    self.cd_into(&name);
-                }
-                ui.separator();
-                if ui.button("+ new tab").clicked() {
-                    let ctx = ui.ctx().clone();
-                    self.new_tab(&ctx);
-                }
             });
     }
 
-    /// Bottom bar: a "start menu" with app actions on the left and the
-    /// active tab status on the right.
-    fn show_bottom_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("start_menu").resizable(false).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let mut action = None;
-                ui.menu_button("❯ comma", |ui| {
-                    if ui.button("New tab  ⌘T").clicked() {
-                        action = Some(MenuAction::NewTab);
-                        ui.close();
-                    }
-                    if ui.button("Close tab  ⌘W").clicked() {
-                        action = Some(MenuAction::CloseTab);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Copy selection  ⌘C").clicked() {
-                        action = Some(MenuAction::CopySelection);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Scroll to top").clicked() {
-                        action = Some(MenuAction::ScrollTop);
-                        ui.close();
-                    }
-                    if ui.button("Scroll to bottom").clicked() {
-                        action = Some(MenuAction::ScrollBottom);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Quit").clicked() {
-                        action = Some(MenuAction::Quit);
-                    }
-                });
-                if let Some(tab) = self.tabs.active() {
-                    ui.separator();
-                    ui.label(tab.label());
-                }
-                let status = format!("tab {}/{}", self.tabs.active_index() + 1, self.tabs.len());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(status);
-                });
-                if let Some(action) = action {
-                    self.apply_menu_action(ui.ctx(), action);
-                }
-            });
+    /// The command palette: a query line and the matching entries, top
+    /// center over the terminal. Keys go here, not to the PTY, while open.
+    fn show_palette(&mut self, ctx: &Context) {
+        let Some(palette) = &mut self.command_palette else {
+            return;
+        };
+        let (up, down, enter, escape) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                i.consume_key(Modifiers::NONE, Key::Enter),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+            )
         });
+        if up {
+            palette.move_selection(-1);
+        }
+        if down {
+            palette.move_selection(1);
+        }
+        let mut close = escape;
+        let mut chosen = enter.then(|| palette.chosen()).flatten();
+        close |= enter;
+        egui::Area::new(egui::Id::new("palette"))
+            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 48.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(420.0);
+                    let before = palette.query.clone();
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut palette.query)
+                            .hint_text("Type a command, tab or directory")
+                            .frame(egui::Frame::NONE)
+                            .desired_width(f32::INFINITY),
+                    );
+                    edit.request_focus();
+                    if palette.query != before {
+                        palette.selected = 0;
+                    }
+                    ui.separator();
+                    let selected = palette.selected;
+                    for (i, item) in palette.matches().into_iter().take(12).enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(i == selected, &item.label).clicked() {
+                                chosen = Some(item.action.clone());
+                                close = true;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.weak(item.hint);
+                            });
+                        });
+                    }
+                });
+            });
+        if close {
+            self.command_palette = None;
+        }
+        if let Some(action) = chosen {
+            self.apply_action(ctx, action);
+        }
     }
 
-    fn apply_menu_action(&mut self, ctx: &Context, action: MenuAction) {
+    fn apply_action(&mut self, ctx: &Context, action: Action) {
         match action {
-            MenuAction::NewTab => self.new_tab(ctx),
-            MenuAction::CloseTab => {
+            Action::NewTab => self.new_tab(ctx),
+            Action::CloseTab => {
                 let index = self.tabs.active_index();
                 self.close_tab(index);
             }
-            MenuAction::CopySelection => {
+            Action::CopySelection => {
                 if let Some(tab) = self.tabs.active() {
                     Self::handle_copy(ctx, tab);
                 }
             }
-            MenuAction::ScrollTop => {
+            Action::ScrollTop => {
                 if let Some(tab) = self.tabs.active() {
                     tab.term().lock().scroll_display(Scroll::Top);
                 }
             }
-            MenuAction::ScrollBottom => {
+            Action::ScrollBottom => {
                 if let Some(tab) = self.tabs.active() {
                     scroll_to_bottom(tab);
                 }
             }
-            MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Action::SwitchTab(index) => self.tabs.switch(index),
+            Action::Cd(dir) => self.cd_into(&dir),
         }
     }
-}
-
-/// Actions of the bottom "start menu".
-enum MenuAction {
-    NewTab,
-    CloseTab,
-    CopySelection,
-    ScrollTop,
-    ScrollBottom,
-    Quit,
 }
 
 impl eframe::App for CommaApp {
@@ -675,14 +577,12 @@ impl eframe::App for CommaApp {
         let ctx = ui.ctx().clone();
 
         self.handle_events(&ctx);
-        self.refresh_browser();
 
         let cell = render::cell_size(&ctx, self.config.font_size);
         if cell.0 > 0.0 && cell.1 > 0.0 {
             self.cell_size = Vec2::new(cell.0, cell.1);
         }
 
-        self.show_bottom_bar(ui);
         self.show_sidebar(ui);
 
         let focused = ctx.input(|i| i.focused);
@@ -693,7 +593,9 @@ impl eframe::App for CommaApp {
             let size = ui.available_size();
             let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
             self.sync_size(rect);
-            self.handle_terminal_input(&ctx, rect, &response);
+            if self.command_palette.is_none() {
+                self.handle_terminal_input(&ctx, rect, &response);
+            }
             if let Some(tab) = self.tabs.active() {
                 let mut term = tab.term().lock();
                 let mut cache = tab.render_cache().borrow_mut();
@@ -713,6 +615,8 @@ impl eframe::App for CommaApp {
                     && matches!(term.renderable_content().cursor.shape, CursorShape::Block);
             }
         });
+
+        self.show_palette(&ctx);
 
         // Wake up exactly at the next blink toggle instead of free-running.
         if blinking {
