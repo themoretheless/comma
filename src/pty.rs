@@ -15,6 +15,7 @@ use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::vte::ansi::Processor;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::blocks::{Blocks, MarkScanner, Segment};
 use crate::config;
 
 /// Minimum interval between repaint requests from terminal events (~60 fps).
@@ -99,6 +100,15 @@ pub(crate) struct PtySession {
     pub killer: Box<dyn ChildKiller + Send + Sync>,
     /// Pid of the shell process (used to poll its cwd for the tab label).
     pub child_pid: Option<i32>,
+    /// Command blocks recorded from the shell's OSC 133 marks.
+    pub blocks: Arc<Mutex<Blocks>>,
+}
+
+/// Cursor line counted from the top of the scrollback, stable while output
+/// scrolls (until the scrollback is full and old lines drop off).
+pub(crate) fn absolute_cursor_line<T>(term: &Term<T>) -> usize {
+    let line = term.grid().cursor.point.line.0.max(0) as usize;
+    term.grid().history_size() + line
 }
 
 /// Which shell to run in a new session, by priority:
@@ -169,19 +179,35 @@ pub(crate) fn spawn(
     };
     let term = Arc::new(FairMutex::new(Term::new(term_config, size, proxy.clone())));
 
+    let blocks = Arc::new(Mutex::new(Blocks::default()));
     let reader_term = term.clone();
+    let reader_blocks = blocks.clone();
     thread::spawn(move || {
         let mut processor: Processor = Processor::new();
+        let mut scanner = MarkScanner::default();
         let mut buf = [0u8; 64 * 1024];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    // Feed the parser in chunks, releasing the terminal lock
-                    // between them so the GUI can render mid-stream.
-                    for chunk in buf[..n].chunks(ADVANCE_CHUNK) {
-                        let mut term = reader_term.lock();
-                        processor.advance(&mut *term, chunk);
+                    for segment in scanner.feed(&buf[..n]) {
+                        match segment {
+                            // Feed the parser in chunks, releasing the terminal
+                            // lock between them so the GUI can render mid-stream.
+                            Segment::Bytes(bytes) => {
+                                for chunk in bytes.chunks(ADVANCE_CHUNK) {
+                                    let mut term = reader_term.lock();
+                                    processor.advance(&mut *term, chunk);
+                                }
+                            }
+                            Segment::Mark(mark) => {
+                                let term = reader_term.lock();
+                                let line = absolute_cursor_line(&term);
+                                if let Ok(mut blocks) = reader_blocks.lock() {
+                                    blocks.apply(mark, line);
+                                }
+                            }
+                        }
                     }
                     // New output: repaint, and mark background tabs unseen.
                     proxy.send_event(Event::Wakeup);
@@ -204,6 +230,7 @@ pub(crate) fn spawn(
         master: pair.master,
         killer,
         child_pid,
+        blocks,
     })
 }
 

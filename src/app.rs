@@ -4,7 +4,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::Event;
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::CursorShape;
 use egui::{Context, Key, Modifiers, Rect, Sense, Vec2};
@@ -14,6 +15,11 @@ use crate::tab::Tab;
 use crate::tabs::Tabs;
 use crate::palette::{Action, Palette};
 use crate::{config, input, render};
+
+/// Width of the command gutter left of the terminal grid.
+const GUTTER: f32 = 14.0;
+/// Padding on the other sides of the grid.
+const PADDING: f32 = 6.0;
 
 /// Block-cursor blink: one period visible, one period hidden.
 const BLINK_PERIOD: Duration = Duration::from_millis(530);
@@ -197,12 +203,91 @@ impl CommaApp {
             Key::T => self.new_tab(ctx),
             Key::W => self.close_tab(self.tabs.active_index()),
             Key::K => self.open_palette(),
+            Key::C => self.apply_action(ctx, Action::CopyLastOutput),
+            Key::ArrowUp => self.apply_action(ctx, Action::PrevCommand),
+            Key::ArrowDown => self.apply_action(ctx, Action::NextCommand),
             _ => {}
         }
     }
 
     fn is_shortcut(key: Key, mods: &Modifiers) -> bool {
-        mods.command && (matches!(key, Key::T | Key::W | Key::K) || input::digit_index(key).is_some())
+        mods.command
+            && (matches!(key, Key::T | Key::W | Key::K | Key::ArrowUp | Key::ArrowDown)
+                || (key == Key::C && mods.shift)
+                || input::digit_index(key).is_some())
+    }
+
+    /// Scroll so the prompt of the previous (`up`) or next command sits at
+    /// the top of the view; past the last command, back to the bottom.
+    fn jump_to_command(tab: &Tab, up: bool) {
+        let mut term = tab.term().lock();
+        let history = term.grid().history_size();
+        let offset = term.grid().display_offset();
+        let top = history - offset;
+        let target = {
+            let blocks = tab.blocks();
+            if up { blocks.prompt_before(top) } else { blocks.prompt_after(top) }
+        };
+        match target {
+            Some(line) if line <= history => {
+                let delta = (history - line) as i32 - offset as i32;
+                term.scroll_display(Scroll::Delta(delta));
+            }
+            _ if !up => term.scroll_display(Scroll::Bottom),
+            _ => {}
+        }
+    }
+
+    /// Text of the last finished command's output.
+    fn last_output(tab: &Tab) -> Option<String> {
+        let range = tab.blocks().last_output()?;
+        if range.is_empty() {
+            return Some(String::new());
+        }
+        let term = tab.term().lock();
+        let history = term.grid().history_size() as i64;
+        let line = |abs: usize| abs as i64 - history;
+        let (first, last) = (line(range.start), line(range.end - 1));
+        if first < -history || last >= term.screen_lines() as i64 {
+            return None;
+        }
+        let start = Point::new(Line(first as i32), Column(0));
+        let end = Point::new(Line(last as i32), Column(term.columns() - 1));
+        Some(term.bounds_to_string(start, end).trim_end().to_string())
+    }
+
+    /// Thin bars left of the terminal marking each command, from its prompt
+    /// to its end: green when it succeeded, red when it failed, dim while it
+    /// runs.
+    fn draw_gutter(&self, painter: &egui::Painter, tab: &Tab, gutter: Rect, top: f32) {
+        let term = tab.term().lock();
+        let history = term.grid().history_size() as i64;
+        let offset = term.grid().display_offset() as i64;
+        let cursor = crate::pty::absolute_cursor_line(&term) + 1;
+        drop(term);
+        let color = |index: usize| {
+            let rgb = self.palette.indexed[index];
+            egui::Color32::from_rgb(rgb.r, rgb.g, rgb.b)
+        };
+        let painter = painter.with_clip_rect(gutter);
+        for block in tab.blocks().commands() {
+            let end = block.end.unwrap_or(cursor);
+            let row = |abs: usize| abs as i64 - history + offset;
+            let y0 = top + row(block.prompt) as f32 * self.cell_size.y + 2.0;
+            let y1 = top + row(end) as f32 * self.cell_size.y - 2.0;
+            if y1 < gutter.top() || y0 > gutter.bottom() || y1 <= y0 {
+                continue;
+            }
+            let fill = match block.status {
+                Some(0) => color(2).gamma_multiply(0.7),
+                Some(_) => color(1),
+                None if block.end.is_none() => color(8),
+                None => color(8).gamma_multiply(0.5),
+            };
+            let x = gutter.center().x;
+            let bar = Rect::from_min_max(egui::pos2(x - 1.0, y0), egui::pos2(x + 1.0, y1));
+            painter.rect_filled(bar, 1.0, fill);
+        }
     }
 
     /// Keyboard, scroll and selection input for the active terminal.
@@ -666,6 +751,16 @@ impl CommaApp {
             }
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Action::SwitchTab(index) => self.tabs.switch(index),
+            Action::CopyLastOutput => {
+                if let Some(text) = self.tabs.active().and_then(Self::last_output) {
+                    ctx.copy_text(text);
+                }
+            }
+            Action::PrevCommand | Action::NextCommand => {
+                if let Some(tab) = self.tabs.active() {
+                    Self::jump_to_command(tab, action == Action::PrevCommand);
+                }
+            }
             Action::Cd(dir) => self.cd_into(&dir),
         }
     }
@@ -690,12 +785,20 @@ impl eframe::App for CommaApp {
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let size = ui.available_size();
-            let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+            let (area, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+            // Breathing room around the grid; the left strip holds the
+            // command gutter.
+            let gutter = Rect::from_min_max(area.min, egui::pos2(area.left() + GUTTER, area.bottom()));
+            let rect = Rect::from_min_max(
+                egui::pos2(gutter.right(), area.top() + PADDING),
+                egui::pos2(area.right() - PADDING, area.bottom() - PADDING),
+            );
             self.sync_size(rect);
             if self.command_palette.is_none() {
                 self.handle_terminal_input(&ctx, rect, &response);
             }
             if let Some(tab) = self.tabs.active() {
+                self.draw_gutter(ui.painter(), tab, gutter, rect.top());
                 let mut term = tab.term().lock();
                 let mut cache = tab.render_cache().borrow_mut();
                 render::draw(
