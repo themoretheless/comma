@@ -1,4 +1,5 @@
 mod app;
+mod blocks;
 mod config;
 mod input;
 mod palette;

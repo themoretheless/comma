@@ -12,6 +12,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Term;
 use portable_pty::{ChildKiller, MasterPty, PtySize};
 
+use crate::blocks::Blocks;
 use crate::config;
 use crate::pty::{self, EventProxy, PtySession, TermSize};
 use crate::render;
@@ -39,6 +40,7 @@ pub(crate) struct Tab {
     dead: bool,
     /// Output arrived while the tab was in the background.
     unseen: bool,
+    blocks: Arc<Mutex<Blocks>>,
 }
 
 /// One poll of the shell's state, refreshed at most every `CWD_POLL`.
@@ -60,7 +62,7 @@ impl Tab {
         cell_height: f32,
         config: &config::Config,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let PtySession { term, writer, master, killer, child_pid } =
+        let PtySession { term, writer, master, killer, child_pid, blocks } =
             pty::spawn(id, sender, ctx, size, cell_width, cell_height, config)?;
         Ok(Self {
             id,
@@ -80,6 +82,7 @@ impl Tab {
             render_cache: std::cell::RefCell::new(render::RowCache::new()),
             dead: false,
             unseen: false,
+            blocks,
         })
     }
 
@@ -89,6 +92,11 @@ impl Tab {
 
     pub(crate) fn term(&self) -> &Arc<FairMutex<Term<EventProxy>>> {
         &self.term
+    }
+
+    /// Command blocks recorded from the shell's semantic-prompt marks.
+    pub(crate) fn blocks(&self) -> std::sync::MutexGuard<'_, Blocks> {
+        self.blocks.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn render_cache(&self) -> &std::cell::RefCell<render::RowCache> {

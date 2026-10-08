@@ -271,7 +271,18 @@ fn main() {
         let _ = rl.load_history(path);
     }
 
+    // Semantic prompt marks (OSC 133) let the comma terminal find command
+    // boundaries; other terminals don't need them.
+    let marks = std::env::var_os("COMMA_TERM").is_some();
+    let mut ran_command = false;
     loop {
+        if marks {
+            if ran_command {
+                mark(&format!("D;{}", shell.last_status));
+            }
+            mark("A");
+            ran_command = false;
+        }
         // Reap background jobs (mark stopped, drop finished) before the
         // prompt, so `jobs` output and job ids stay fresh.
         shell.reap_jobs();
@@ -284,6 +295,10 @@ fn main() {
                 }
                 let _ = rl.add_history_entry(line);
                 shell.history.push(line.to_string());
+                if marks {
+                    mark("C");
+                    ran_command = true;
+                }
                 match exec::parse_line(&shell, line) {
                     Ok(script) => {
                         exec::execute_script(&mut shell, &script);
@@ -311,6 +326,15 @@ fn main() {
     if let Some(path) = &history_path {
         let _ = rl.save_history(path);
     }
+}
+
+/// Write one OSC 133 semantic-prompt mark (`A` prompt, `C` output start,
+/// `D;status` command end) straight to the terminal.
+fn mark(body: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]133;{body}\x07");
+    let _ = out.flush();
 }
 
 /// The shell ignores job-control signals; children restore SIG_DFL via
